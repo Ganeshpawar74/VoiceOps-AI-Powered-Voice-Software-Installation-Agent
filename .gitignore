@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.env
+
+# Docker
+.docker/
+
+# Replit (removed from project)
+# .replit — deleted
+# replit.md — deleted
+# .agents/ — deleted
+
+# Downloads temp dir
+/tmp/voiceops_downloads/
+
+# Logs
+*.log
+logs/
+
+# Whisper model cache
+/models/
+
+# Qdrant local storage
+/qdrant_storage/

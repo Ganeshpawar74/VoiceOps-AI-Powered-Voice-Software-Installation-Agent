@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for Playwright and subprocess tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ curl libgomp1 wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright browsers (used by browser_agent)
+RUN playwright install chromium --with-deps || true
+
+COPY app/ ./app/
+COPY .env.example .env
+
+# Celery worker entrypoint — overridden by docker-compose command
+CMD ["celery", "-A", "app.services.tasks.celery_app", "worker", \
+     "--loglevel=info", "-Q", "installs", "-c", "4"]

@@ -1,0 +1,365 @@
+# =============================================================
+# VoiceOps — Production Docker Compose
+# =============================================================
+# Services:
+#   Infrastructure : postgres, redis, qdrant
+#   Application    : api, worker (x2 replicas), flower
+#   Frontend       : frontend (React/Next)
+#   Proxy          : nginx (port 80 → api + frontend)
+#   Observability  : jaeger, prometheus, grafana
+# =============================================================
+
+version: "3.9"
+
+# ── Shared environment injected into api + worker ─────────────
+x-env: &common-env
+  # App
+  ENVIRONMENT: production
+  DEBUG: "false"
+  API_PREFIX: /api/v1
+
+  # Database — matches postgres service below
+  DB_URL: postgresql+asyncpg://voiceops:voiceops_secret@postgres:5432/voiceops
+  DB_POOL_SIZE: "20"
+  DB_MAX_OVERFLOW: "40"
+
+  # Redis — DB 0=general, 1=celery broker, 2=celery results
+  REDIS_URL: redis://redis:6379/0
+  REDIS_CELERY_BROKER: redis://redis:6379/1
+  REDIS_CELERY_BACKEND: redis://redis:6379/2
+
+  # Celery
+  CELERY_MAX_RETRIES: "3"
+  CELERY_RETRY_BACKOFF: "60"
+
+  # LLM — override in .env with real keys
+  LLM_PROVIDER: mistral
+  LLM_INTENT_MODEL: mistral-small-latest
+  LLM_PLANNER_MODEL: mistral-small-latest
+  LLM_TOOL_MODEL: mistral-small-latest
+  LLM_TEMPERATURE: "0.1"
+  LLM_MAX_TOKENS: "2048"
+  LLM_TIMEOUT: "30"
+
+  # STT
+  STT_PROVIDER: whisper
+  STT_WHISPER_MODEL_SIZE: base
+  STT_WHISPER_DEVICE: cpu
+  STT_WHISPER_COMPUTE_TYPE: int8
+
+  # TTS
+  TTS_PROVIDER: sarvam
+  TTS_TARGET_LANGUAGE_CODE: en-IN
+  TTS_SPEAKER: meera
+  TTS_MODEL: "bulbul:v1"
+  TTS_ENABLE: "true"
+
+  # Vector DB
+  VECTOR_PROVIDER: qdrant
+  VECTOR_QDRANT_URL: http://qdrant:6333
+  VECTOR_QDRANT_COLLECTION: voiceops_docs
+
+  # Feature flags
+  FEATURE_RAG_ENABLED: "false"
+  FEATURE_HUMAN_IN_LOOP: "false"
+  FEATURE_TTS_ENABLED: "true"
+  FEATURE_OCR_FALLBACK: "true"
+
+  # Security — CHANGE JWT_SECRET in .env for production!
+  SEC_REQUIRE_HTTPS: "false"
+  SEC_VERIFY_CHECKSUMS: "true"
+  SEC_VERIFY_PUBLISHER: "true"
+
+  # Observability
+  OBS_LOG_LEVEL: INFO
+  OBS_LOG_FORMAT: json
+  OBS_ENABLE_TRACING: "true"
+  OBS_ENABLE_METRICS: "true"
+  OBS_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+  OBS_PROMETHEUS_PORT: "9090"
+
+  # Browser agent
+  BROWSER_HEADLESS: "true"
+  BROWSER_TIMEOUT_MS: "30000"
+
+
+services:
+
+  # ╔══════════════════════════════════════════╗
+  # ║           INFRASTRUCTURE                 ║
+  # ╚══════════════════════════════════════════╝
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: voiceops_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: voiceops
+      POSTGRES_PASSWORD: voiceops_secret
+      POSTGRES_DB: voiceops
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./app/database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voiceops -d voiceops"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    networks:
+      - voiceops_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: voiceops_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1
+      --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    networks:
+      - voiceops_net
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: voiceops_qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - voiceops_net
+
+  # ╔══════════════════════════════════════════╗
+  # ║           APPLICATION                    ║
+  # ╚══════════════════════════════════════════╝
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+      args:
+        PYTHON_VERSION: "3.11"
+    container_name: voiceops_api
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    env_file:
+      - .env                     # API keys (LLM_MISTRAL_API_KEY, TTS_SARVAM_API_KEY, etc.)
+    ports:
+      - "8000:8000"
+    volumes:
+      - downloads_vol:/tmp/voiceops_downloads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    networks:
+      - voiceops_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    # Override default CMD — 4 concurrent install tasks per worker
+    command: >
+      celery -A app.services.tasks.celery_app worker
+      --loglevel=info
+      -Q installs
+      -c 4
+      --without-heartbeat
+      --without-gossip
+      --without-mingle
+    environment:
+      <<: *common-env
+    env_file:
+      - .env
+    volumes:
+      - downloads_vol:/tmp/voiceops_downloads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+    networks:
+      - voiceops_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  flower:
+    image: mher/flower:2.0
+    container_name: voiceops_flower
+    restart: unless-stopped
+    command: >
+      celery flower
+      --broker=redis://redis:6379/1
+      --port=5555
+      --url-prefix=flower
+      --persistent=True
+      --db=/data/flower.db
+    volumes:
+      - flower_data:/data
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - voiceops_net
+
+  # ╔══════════════════════════════════════════╗
+  # ║           FRONTEND                       ║
+  # ╚══════════════════════════════════════════╝
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: voiceops_frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost/api
+      NEXT_PUBLIC_WS_URL: ws://localhost/api/v1/ws
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - voiceops_net
+
+  # ╔══════════════════════════════════════════╗
+  # ║           PROXY                          ║
+  # ╚══════════════════════════════════════════╝
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: voiceops_nginx
+    restart: unless-stopped
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+      - frontend
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      retries: 3
+    networks:
+      - voiceops_net
+
+  # ╔══════════════════════════════════════════╗
+  # ║           OBSERVABILITY                  ║
+  # ╚══════════════════════════════════════════╝
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    container_name: voiceops_jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      COLLECTOR_ZIPKIN_HOST_PORT: ":9411"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14268:14268"   # HTTP collector
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    networks:
+      - voiceops_net
+
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: voiceops_prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - voiceops_net
+
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: voiceops_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "http://localhost:3001"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - voiceops_net
+
+
+# ── Volumes ───────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  grafana_data:
+  prometheus_data:
+  flower_data:
+  downloads_vol:       # shared between api + worker for installer files
+
+# ── Network ───────────────────────────────────────────────────
+networks:
+  voiceops_net:
+    driver: bridge
+    name: voiceops_net

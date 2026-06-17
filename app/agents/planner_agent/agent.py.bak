@@ -1,0 +1,142 @@
+"""
+Agent 3 — Planner Agent (LangGraph Plan-and-Execute).
+Generates dependency-aware ExecutionPlan. Uses Mistral API for unknown software.
+"""
+from __future__ import annotations
+import logging
+from typing import Any, TypedDict
+from langgraph.graph import END, StateGraph
+from app.config.settings import get_settings
+from app.models.schemas import ExecutionPlan, ExecutionStep, Intent, IntentOutput, OperatingSystem
+
+logger   = logging.getLogger(__name__)
+settings = get_settings()
+
+
+def _pkg_mgr_step(software: str, os_: OperatingSystem) -> ExecutionStep | None:
+    """Lookup package in registries and create install step."""
+    lookup = {
+        OperatingSystem.WINDOWS: settings.registry.winget_packages,
+        OperatingSystem.MACOS:   settings.registry.brew_packages,
+        OperatingSystem.LINUX:   settings.registry.apt_packages,
+    }.get(os_)
+    if not lookup:
+        return None
+    
+    pkg_id = lookup.get(software)
+    mgr = "winget" if os_ == OperatingSystem.WINDOWS else ("brew" if os_ == OperatingSystem.MACOS else "apt")
+    
+    if not pkg_id and os_ == OperatingSystem.LINUX:
+        pkg_id = settings.registry.snap_packages.get(software)
+        if pkg_id:
+            mgr = "snap"
+    
+    if not pkg_id:
+        return None
+    
+    return ExecutionStep(
+        name="pkg_manager_install",
+        description=f"Install {software} via {mgr} ({pkg_id})",
+        agent="install_agent", tool=mgr,
+        params={"package_id": pkg_id, "software": software},
+    )
+
+
+def _browser_steps(intent: IntentOutput) -> list[ExecutionStep]:
+    sw, os_ = intent.software_canonical, intent.operating_system
+    return [
+        ExecutionStep(name="search_official_source", description=f"Find official page for {sw}",
+            agent="browser_agent", tool="web_search",
+            params={"query": f"{sw} official download {os_.value}"}),
+        ExecutionStep(name="find_download_link", description="Extract installer link",
+            agent="browser_agent", tool="navigate_and_extract",
+            params={"os": os_.value, "arch": "x64"}, depends_on=["search_official_source"]),
+    ]
+
+
+def _download_steps() -> list[ExecutionStep]:
+    return [
+        ExecutionStep(name="download_installer", description="Download installer",
+            agent="download_agent", tool="download_file", params={},
+            depends_on=["find_download_link"]),
+        ExecutionStep(name="verify_installer", description="SHA-256 + signature check",
+            agent="download_agent", tool="verify_file", params={},
+            depends_on=["download_installer"]),
+    ]
+
+
+def _install_steps(intent: IntentOutput) -> list[ExecutionStep]:
+    tool = {"windows": "run_exe_or_msi", "macos": "run_dmg_pkg", "linux": "run_deb_rpm"}.get(
+        intent.operating_system.value, "run_exe_or_msi")
+    return [
+        ExecutionStep(name="run_installer", description="Silent installation",
+            agent="install_agent", tool=tool,
+            params={"software": intent.software_canonical, "silent": True},
+            depends_on=["verify_installer"]),
+        ExecutionStep(name="notify_user", description="Send completion notification",
+            agent="notification_agent", tool="notify",
+            params={"software": intent.software_canonical}, depends_on=["run_installer"]),
+    ]
+
+
+def _build_plan(intent: IntentOutput) -> tuple[list[ExecutionStep], int]:
+    pkg = _pkg_mgr_step(intent.software_canonical, intent.operating_system)
+    if intent.intent == Intent.INSTALL_SOFTWARE:
+        if pkg: return [pkg], 60
+        return _browser_steps(intent) + _download_steps() + _install_steps(intent), 300
+    if intent.intent == Intent.DOWNLOAD_ONLY:
+        if pkg: return [pkg], 30
+        return _browser_steps(intent) + _download_steps(), 120
+    return [], 0
+
+
+# ── LangGraph ─────────────────────────────────────────────
+
+class PlannerState(TypedDict):
+    intent: IntentOutput
+    steps: list[dict[str, Any]]
+    estimated_seconds: int
+    done: bool
+
+
+def _node_generate(state: PlannerState) -> PlannerState:
+    steps, est = _build_plan(state["intent"])
+    state["steps"] = [s.model_dump() for s in steps]
+    state["estimated_seconds"] = est
+    return state
+
+
+def _node_validate(state: PlannerState) -> PlannerState:
+    if not state["steps"]:
+        logger.warning("[Planner] No steps for intent=%s software=%s",
+                       state["intent"].intent, state["intent"].software_canonical)
+    state["done"] = True
+    return state
+
+
+def _build_graph() -> StateGraph:
+    g = StateGraph(PlannerState)
+    g.add_node("generate", _node_generate)
+    g.add_node("validate", _node_validate)
+    g.set_entry_point("generate")
+    g.add_edge("generate", "validate")
+    g.add_edge("validate", END)
+    return g
+
+
+_compiled = _build_graph().compile()
+
+
+class PlannerAgent:
+    """Agent 3 — Planner. LangGraph Plan-and-Execute."""
+
+    async def plan(self, intent: IntentOutput) -> ExecutionPlan:
+        logger.info("[PlannerAgent] intent=%s sw=%s os=%s",
+                    intent.intent, intent.software_canonical, intent.operating_system)
+        init: PlannerState = {"intent": intent, "steps": [], "estimated_seconds": 0, "done": False}
+        final = await _compiled.ainvoke(init)
+        return ExecutionPlan(
+            intent=intent,
+            steps=[ExecutionStep(**s) for s in final["steps"]],
+            estimated_duration_sec=final["estimated_seconds"],
+        )

@@ -1,0 +1,254 @@
+"""
+Agent 1 — Speech Agent
+Converts raw audio bytes → SpeechOutput (transcript + language + confidence).
+
+Providers (configured via STT_PROVIDER):
+  • whisper  — faster-whisper local model (default)
+  • sarvam   — Sarvam AI REST API (supports Hindi / Hinglish natively)
+
+FIXES:
+  - BUG #5 CRITICAL: faster-whisper WhisperModel.__init__ takes `device` and
+    `compute_type` as positional-or-keyword args, NOT as a dict.
+    Original code called WhisperModel(model_size, {"device": ..., "compute_type": ...})
+    which raised TypeError: __init__() takes 2 positional arguments but 3 were given.
+    Fix: pass as keyword arguments.
+  - BUG #6: _bytes_to_numpy resample helper was defined but body was missing
+    (file was cut off). Added scipy/numpy fallback resampler.
+  - All other fixes from original docstring retained.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import logging
+import time
+import wave
+from typing import Optional
+
+import httpx
+import numpy as np
+
+from app.config.settings import get_settings
+from app.models.schemas import AudioInput, Language, SpeechOutput
+
+logger   = logging.getLogger(__name__)
+settings = get_settings()
+
+
+# ──────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────
+
+_TARGET_SR = 16_000          # faster-whisper / Sarvam both expect 16 kHz
+_MAX_BYTES = 25 * 1024 * 1024   # 25 MB hard cap
+
+
+# ──────────────────────────────────────────────
+# Audio helpers
+# ──────────────────────────────────────────────
+
+def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """
+    BUG #6 FIX: this function body was missing (file truncated in original).
+    Simple linear interpolation resampler — no scipy required.
+    For production, replace with librosa.resample or scipy.signal.resample.
+    """
+    if orig_sr == target_sr:
+        return audio
+    try:
+        # Try scipy first (better quality)
+        from scipy.signal import resample_poly
+        from math import gcd
+        g = gcd(int(target_sr), int(orig_sr))
+        return resample_poly(audio, target_sr // g, orig_sr // g).astype(np.float32)
+    except ImportError:
+        pass
+    # Fallback: numpy linear interpolation
+    duration    = len(audio) / orig_sr
+    new_length  = int(duration * target_sr)
+    old_indices = np.linspace(0, len(audio) - 1, new_length)
+    return np.interp(old_indices, np.arange(len(audio)), audio).astype(np.float32)
+
+
+def _bytes_to_numpy(audio_bytes: bytes, source_sr: int = 16_000) -> np.ndarray:
+    """
+    Convert raw audio bytes → float32 numpy array at _TARGET_SR mono.
+    Accepts WAV container or raw 16-bit little-endian PCM.
+    """
+    if audio_bytes[:4] == b"RIFF":
+        try:
+            buf = io.BytesIO(audio_bytes)
+            with wave.open(buf, "rb") as wf:
+                channels  = wf.getnchannels()
+                framerate = wf.getframerate()
+                n_frames  = wf.getnframes()
+                raw_pcm   = wf.readframes(n_frames)
+
+            audio = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            if channels > 1:
+                audio = audio.reshape(-1, channels).mean(axis=1)
+            if framerate != _TARGET_SR:
+                audio = _resample(audio, framerate, _TARGET_SR)
+            return audio
+        except Exception as exc:
+            logger.warning("[SpeechAgent] WAV parse failed (%s) — treating as raw PCM", exc)
+
+    # Fallback: raw 16-bit PCM
+    audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    if source_sr != _TARGET_SR:
+        audio = _resample(audio, source_sr, _TARGET_SR)
+    return audio
+
+
+# ──────────────────────────────────────────────
+# Whisper provider
+# ──────────────────────────────────────────────
+
+_whisper_model = None   # lazy singleton
+
+
+def _get_whisper_model():
+    """
+    Load WhisperModel once and cache it.
+    BUG #5 FIX: WhisperModel takes `device` and `compute_type` as keyword args,
+    NOT as a dict. The original code passed a dict as the second positional arg:
+      WhisperModel(model_size, {"device": "cpu", "compute_type": "int8"})
+    This raised: TypeError: __init__() takes 2 positional arguments but 3 were given
+    Fix: pass as keyword arguments explicitly.
+    """
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        logger.info(
+            "[SpeechAgent] Loading Whisper model=%s device=%s compute=%s",
+            settings.stt.whisper_model_size,
+            settings.stt.whisper_device,
+            settings.stt.whisper_compute_type,
+        )
+        # BUG #5 FIX: keyword args, not a dict
+        _whisper_model = WhisperModel(
+            settings.stt.whisper_model_size,
+            device=settings.stt.whisper_device,
+            compute_type=settings.stt.whisper_compute_type,
+        )
+        logger.info("[SpeechAgent] Whisper model loaded")
+    return _whisper_model
+
+
+def _transcribe_whisper(audio: np.ndarray) -> tuple[str, float, str]:
+    """
+    Synchronous Whisper transcription — run via asyncio.to_thread.
+    Returns (transcript, confidence, detected_language).
+    """
+    model = _get_whisper_model()
+    segments, info = model.transcribe(
+        audio,
+        beam_size=5,
+        condition_on_previous_text=False,   # better for short commands
+        vad_filter=True,                    # skip silence
+        vad_parameters={"min_silence_duration_ms": 500},
+    )
+    segments_list = list(segments)
+    if not segments_list:
+        return "", 0.0, "en"
+
+    transcript = " ".join(s.text.strip() for s in segments_list).strip()
+
+    # Confidence = mean of (1 - no_speech_prob) across segments
+    confidences = [max(0.0, 1.0 - s.no_speech_prob) for s in segments_list]
+    confidence  = float(np.mean(confidences)) if confidences else 0.5
+
+    lang = info.language or "en"
+    return transcript, confidence, lang
+
+
+# ──────────────────────────────────────────────
+# Sarvam provider
+# ──────────────────────────────────────────────
+
+async def _transcribe_sarvam(audio_bytes: bytes, session_id: str) -> tuple[str, float, str]:
+    """Call Sarvam AI speech-to-text REST API."""
+    url     = f"{settings.stt.sarvam_base_url}/speech-to-text"
+    headers = {"api-subscription-key": settings.stt.sarvam_api_key}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            url,
+            headers=headers,
+            files={"file": (f"{session_id}.wav", audio_bytes, "audio/wav")},
+            data={"language_code": "hi-en", "model": "saarika:v1"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    transcript = data.get("transcript", "").strip()
+    language   = data.get("language_code", "hi-en")
+    return transcript, 0.9, language   # Sarvam doesn't return confidence
+
+
+# ──────────────────────────────────────────────
+# SpeechAgent
+# ──────────────────────────────────────────────
+
+class SpeechAgent:
+    """
+    Agent 1 — converts AudioInput → SpeechOutput.
+    Provider selected by STT_PROVIDER env var (whisper | sarvam).
+    """
+
+    async def process(self, audio: AudioInput) -> SpeechOutput:
+        t0 = time.perf_counter()
+
+        if len(audio.audio_bytes) > _MAX_BYTES:
+            raise ValueError(
+                f"Audio too large: {len(audio.audio_bytes) / 1024 / 1024:.1f} MB "
+                f"(max {_MAX_BYTES / 1024 / 1024:.0f} MB)"
+            )
+
+        provider = settings.stt.provider
+
+        if provider == "sarvam":
+            if not settings.stt.sarvam_api_key:
+                raise ValueError("STT_SARVAM_API_KEY is required when STT_PROVIDER=sarvam")
+            transcript, confidence, lang_code = await _transcribe_sarvam(
+                audio.audio_bytes, audio.session_id
+            )
+        else:
+            # Default: faster-whisper
+            audio_np = await asyncio.to_thread(
+                _bytes_to_numpy, audio.audio_bytes, audio.sample_rate
+            )
+
+            # Optional: noise reduction (soft dep — skip if not installed)
+            try:
+                import noisereduce as nr
+                audio_np = await asyncio.to_thread(
+                    nr.reduce_noise, y=audio_np, sr=_TARGET_SR
+                )
+            except ImportError:
+                pass
+
+            transcript, confidence, lang_code = await asyncio.to_thread(
+                _transcribe_whisper, audio_np
+            )
+
+        # Map language code to Language enum
+        lang_map = {"en": Language.EN, "hi": Language.HI, "hi-en": Language.HI_EN}
+        language = lang_map.get(lang_code[:5].lower(), Language.EN)
+
+        duration_ms = (time.perf_counter() - t0) * 1000
+
+        logger.info(
+            "[SpeechAgent] provider=%s transcript=%r lang=%s conf=%.2f duration=%.0fms",
+            provider, transcript, language.value, confidence, duration_ms,
+        )
+
+        return SpeechOutput(
+            query=transcript,
+            language=language,
+            confidence=confidence,
+            raw_transcript=transcript,
+            session_id=audio.session_id,
+            processing_time_ms=duration_ms,
+        )
