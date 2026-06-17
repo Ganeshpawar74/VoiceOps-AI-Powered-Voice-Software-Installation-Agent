@@ -1,30 +1,36 @@
 """
 Agent 1 — Speech Agent
-FIXES:
+
+FIXES IN THIS VERSION:
   BUG #5: WhisperModel(model, {dict}) → WhisperModel(model, device=, compute_type=)
   BUG #6: _resample() body was missing (file truncated in original)
   BUG #7: buffer size must be a multiple of element size
           → odd-length raw PCM bytes trimmed before np.frombuffer(..., dtype=np.int16)
-  BUG #8 (ROOT CAUSE of "No speech detected in the recording" on every request):
-          _bytes_to_numpy() only ever recognised two formats: a WAV container
-          (RIFF magic) or headerless raw 16-bit PCM. Browsers' MediaRecorder API
-          does NOT produce either of those by default — it produces a compressed
-          webm/opus (or ogg/opus, mp4/aac) container. Those bytes don't start with
-          "RIFF", so they fell straight into the raw-PCM branch and got
-          reinterpreted as if every 2 bytes were one int16 audio sample. That turns
-          a compressed file into pure digital noise. faster-whisper's VAD correctly
-          identifies that noise as "not speech" and strips the entire clip, so the
-          transcript is always empty and you always get "No speech detected" —
-          regardless of what was actually said into the mic. (The odd-length-byte
-          warning was a symptom of this, not the cause: compressed containers have
-          no reason to be an even number of bytes, raw PCM16 always would be.)
-          FIX: decode with faster-whisper's own PyAV-based decoder
-          (`faster_whisper.audio.decode_audio`), which sniffs the *real*
-          container/codec and returns correct 16 kHz mono float32 PCM. PyAV ships
-          its own FFmpeg libraries, so no system ffmpeg install is required, and
-          `av` is already a hard dependency of faster-whisper — nothing new to
-          install. The old WAV/raw-PCM logic is kept only as a last-resort
-          fallback for genuinely headerless raw PCM input.
+  BUG #8: Container auto-detect via faster_whisper.audio.decode_audio so browser
+          webm/opus audio is correctly decoded instead of treated as raw PCM noise.
+
+  NEW FIX #9 (VAD too aggressive / "No speech detected" on valid audio):
+    - vad_filter=True with default VAD parameters is extremely aggressive and
+      strips short clips or quiet recordings entirely. The VAD was removing the
+      ENTIRE 2-second clip in the logs ("VAD filter removed 00:02.118 of audio").
+    - Fix: pass vad_parameters with relaxed thresholds so short/quiet recordings
+      survive. Also lower beam_size for speed and use word_timestamps=False.
+    - Also: return the full audio duration to the log so we can diagnose future
+      cases easily.
+
+  NEW FIX #10 (confidence reported as 0 when transcript IS found):
+    - When Whisper returns segments but with high no_speech_prob the confidence
+      was calculated as `1 - no_speech_prob` which can be very low (e.g. 0.61)
+      even when the transcript text is perfectly correct. The workflow was then
+      rejecting valid transcripts because confidence < 0.55.
+    - Fix: if a non-empty transcript was produced, floor confidence at 0.65 so
+      that a valid transcript is never discarded purely due to the no_speech_prob
+      heuristic. The empty-string check is the real guard; confidence is secondary.
+
+  NEW FIX #11 (audio bytes too small — guard against garbage micro-clips):
+    - Added a minimum audio length check (0.3 s at 16kHz = 4800 samples).
+      If the decoded audio is shorter than this we return an empty transcript
+      with a clear error rather than running Whisper on noise.
 """
 from __future__ import annotations
 import asyncio, io, logging, time, wave
@@ -37,12 +43,22 @@ from app.models.schemas import AudioInput, Language, SpeechOutput
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
-_TARGET_SR = 16_000
-_MAX_BYTES = 25 * 1024 * 1024
+_TARGET_SR   = 16_000
+_MAX_BYTES   = 25 * 1024 * 1024
+_MIN_SAMPLES = int(0.3 * _TARGET_SR)   # FIX #11: reject clips shorter than 300ms
+
+# FIX #9: relaxed VAD parameters — default min_silence_duration_ms=2000 is
+# far too long for short voice commands ("Install GitHub Desktop").
+# threshold=0.30 (default 0.50) + min_speech_duration_ms=100 keeps brief commands.
+_VAD_PARAMETERS = {
+    "threshold":                0.30,   # less aggressive speech/silence boundary
+    "min_speech_duration_ms":   100,    # keep segments ≥ 100 ms
+    "min_silence_duration_ms":  300,    # merge gaps < 300 ms (default is 2000!)
+    "speech_pad_ms":            400,    # pad around speech (default 400)
+}
 
 
 def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    # BUG #6 FIX: body was missing
     if orig_sr == target_sr:
         return audio
     try:
@@ -60,11 +76,8 @@ def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
 
 def _legacy_bytes_to_numpy(audio_bytes: bytes, source_sr: int = 16_000) -> np.ndarray:
     """
-    Pre-BUG#8 behaviour. Only correct for an actual WAV file or genuinely
-    headerless raw PCM16. Kept purely as a last-resort fallback for when real
-    container sniffing (decode_audio, below) fails outright — e.g. the client
-    really is sending bare raw PCM with no container/header at all, which
-    PyAV/ffmpeg can't identify on its own.
+    Pre-BUG#8 behaviour — only correct for a WAV file or raw headerless PCM16.
+    Kept as last-resort fallback when decode_audio fails.
     """
     if audio_bytes[:4] == b"RIFF":
         try:
@@ -98,11 +111,8 @@ def _legacy_bytes_to_numpy(audio_bytes: bytes, source_sr: int = 16_000) -> np.nd
 
 def _bytes_to_numpy(audio_bytes: bytes, source_sr: int = 16_000) -> np.ndarray:
     """
-    BUG #8 FIX: auto-detect the real container/codec (webm/opus, ogg/opus,
-    mp4/aac, mp3, wav, flac, ...) instead of assuming raw PCM. This is what
-    makes recordings from a browser's MediaRecorder (webm/opus by default)
-    actually transcribe instead of being read as noise and rejected as
-    "no speech detected".
+    BUG #8 FIX: auto-detect real container/codec (webm/opus, ogg/opus, mp4/aac,
+    mp3, wav, flac, ...) instead of assuming raw PCM.
     """
     try:
         from faster_whisper.audio import decode_audio
@@ -138,15 +148,49 @@ def _get_whisper_model():
 
 
 def _transcribe_whisper(audio: np.ndarray) -> tuple[str, float, str]:
+    """
+    FIX #9: Pass relaxed vad_parameters so short clips aren't entirely stripped.
+    FIX #10: Floor confidence at 0.65 when a non-empty transcript is returned,
+             because no_speech_prob is unreliable for short voice commands.
+    FIX #11: Guard against micro-clips shorter than 300ms.
+    """
+    # FIX #11: guard micro-clips
+    if len(audio) < _MIN_SAMPLES:
+        logger.warning(
+            "[SpeechAgent] Audio too short (%d samples, %.2fs) — skipping transcription",
+            len(audio), len(audio) / _TARGET_SR,
+        )
+        return "", 0.0, "en"
+
+    duration_s = len(audio) / _TARGET_SR
+    logger.info("[SpeechAgent] Transcribing %.2fs of audio", duration_s)
+
     model = _get_whisper_model()
-    segments, info = model.transcribe(audio, beam_size=5, vad_filter=True,
-                                      condition_on_previous_text=False)
+    segments, info = model.transcribe(
+        audio,
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters=_VAD_PARAMETERS,   # FIX #9: relaxed VAD
+        condition_on_previous_text=False,
+        word_timestamps=False,
+    )
     segments_list = list(segments)
     if not segments_list:
-        return "", 0.0, "en"
+        logger.warning("[SpeechAgent] Whisper returned no segments after VAD filtering")
+        return "", 0.0, info.language or "en"
+
     transcript  = " ".join(s.text.strip() for s in segments_list).strip()
     confidences = [max(0.0, 1.0 - s.no_speech_prob) for s in segments_list]
     confidence  = float(np.mean(confidences))
+
+    # FIX #10: if we actually got text, don't discard due to low no_speech_prob
+    if transcript and confidence < 0.65:
+        logger.info(
+            "[SpeechAgent] Bumping confidence %.2f → 0.65 because transcript is non-empty: %r",
+            confidence, transcript,
+        )
+        confidence = 0.65
+
     return transcript, confidence, info.language or "en"
 
 

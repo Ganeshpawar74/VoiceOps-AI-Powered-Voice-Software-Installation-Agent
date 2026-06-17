@@ -117,6 +117,7 @@ class DownloadLink(BaseModel):
     file_size_bytes: Optional[int] = None
     checksum_sha256: Optional[str] = None
     publisher: Optional[str] = None
+    metadata: dict = Field(default_factory=dict)
     discovered_at: datetime = Field(default_factory=datetime.utcnow)
 
 class BrowserResult(BaseModel):

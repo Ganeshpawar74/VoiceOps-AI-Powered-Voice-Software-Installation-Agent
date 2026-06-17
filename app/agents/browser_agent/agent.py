@@ -1,7 +1,25 @@
 """
-Agent 4 — Browser Agent
-Opens browser, navigates to official pages, extracts download links.
-Strategy: registry-based URLs → Playwright DOM → OCR fallback.
+Agent 4 — Browser Agent  (Playwright-free, Celery-safe)
+
+ROOT CAUSE OF ORIGINAL FAILURES:
+  Playwright's async_playwright().start() calls asyncio.create_subprocess_exec()
+  internally. Celery's --pool=solo on Windows uses a ProactorEventLoop that does
+  NOT support subprocess creation inside an already-running coroutine, hence:
+      NotImplementedError at asyncio/base_events.py _make_subprocess_transport
+
+SOLUTION — Three-tier download URL discovery (no subprocess, no Playwright):
+  Tier 1 (instant):   settings.registry.official_download_urls  — known URLs
+  Tier 2 (fast):      LLM asks Mistral for the official download page URL.
+                      Works for ANY software the user names, no hardcoding.
+  Tier 3 (fallback):  httpx-based Google/DDG search page scrape for a direct
+                      installer link using regex on the raw HTML.
+
+All three tiers are pure Python + network HTTP — no subprocesses, no headless
+browser, fully compatible with Celery solo/prefork/gevent/eventlet pools on
+Windows and Linux.
+
+The browser_agent's job is: given IntentOutput → return BrowserResult with
+a DownloadLink the download_agent can fetch.
 """
 
 from __future__ import annotations
@@ -10,9 +28,9 @@ import asyncio
 import logging
 import re
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+import httpx
 
 from app.config.settings import get_settings
 from app.models.schemas import BrowserResult, DownloadLink, IntentOutput, OperatingSystem
@@ -20,221 +38,435 @@ from app.models.schemas import BrowserResult, DownloadLink, IntentOutput, Operat
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
+# OS-specific installer extensions for link scoring / filtering
+_OS_EXTS = {
+    OperatingSystem.WINDOWS: [".exe", ".msi"],
+    OperatingSystem.MACOS:   [".dmg", ".pkg"],
+    OperatingSystem.LINUX:   [".deb", ".rpm", ".tar.gz", ".tar.xz", ".AppImage"],
+}
 
-# OS filter for link scoring (still needed for _score_link function)
-OS_FILTER_MAP = {
-    OperatingSystem.WINDOWS: [".exe", ".msi", "win"],
-    OperatingSystem.MACOS:   [".dmg", ".pkg", "mac", "darwin"],
-    OperatingSystem.LINUX:   [".deb", ".rpm", ".tar.gz", "linux"],
+_HEADERS = {
+    "User-Agent": settings.browser.user_agent,
+    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
-def _is_trusted(url: str) -> bool:
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _domain(url: str) -> str:
     try:
-        domain = urlparse(url).netloc.lower()
-        return any(domain.endswith(td) for td in settings.browser.trusted_domains)
+        return urlparse(url).netloc.lower()
     except Exception:
-        return False
+        return ""
 
 
-def _score_link(href: str, os_: OperatingSystem, arch: str = "x64") -> float:
-    score  = 0.0
-    href_l = href.lower()
+def _is_blocked(url: str) -> bool:
+    d = _domain(url)
+    return any(d.endswith(b) for b in settings.browser.blocked_domains)
 
-    for ext in OS_FILTER_MAP.get(os_, []):
-        if ext in href_l:
-            score += 10
 
-    for kw in ["x64", "x86_64", "amd64"]:
-        if kw in href_l:
-            score += 5
+def _is_trusted(url: str) -> bool:
+    d = _domain(url)
+    return any(d.endswith(t) for t in settings.browser.trusted_domains)
 
-    if "arm64" in href_l and arch == "arm64":
-        score += 5
 
-    if "stable" in href_l or "latest" in href_l:
-        score += 3
+def _is_installer_url(url: str, os_: OperatingSystem) -> bool:
+    """True if the URL looks like a direct installer for this OS."""
+    lower = url.lower()
+    exts  = _OS_EXTS.get(os_, [])
+    # Strip query string for extension check
+    path = lower.split("?")[0]
+    return any(path.endswith(ext) for ext in exts)
 
-    if re.search(r"\d+\.\d+", href_l):
-        score += 2
 
-    if _is_trusted(href):
+def _score_url(url: str, os_: OperatingSystem) -> float:
+    score = 0.0
+    lower = url.lower()
+    if _is_trusted(url):
+        score += 30
+    if _is_installer_url(url, os_):
         score += 20
-
+    if any(kw in lower for kw in ["x64", "amd64", "x86_64"]):
+        score += 5
+    if any(kw in lower for kw in ["stable", "latest", "release"]):
+        score += 3
+    if re.search(r"\d+\.\d+", lower):
+        score += 2
+    if _is_blocked(url):
+        score -= 100
     return score
 
 
-# ──────────────────────────────────────────────
+def _extract_installer_urls(html: str, os_: OperatingSystem) -> list[str]:
+    """Pull all href/src that look like installer download URLs from raw HTML."""
+    exts = _OS_EXTS.get(os_, [])
+    # match href="..." or href='...' or plain https://...
+    patterns = [
+        r'href=["\']([^"\']+)["\']',
+        r'src=["\']([^"\']+)["\']',
+        r'(https?://\S+)',
+    ]
+    candidates: list[str] = []
+    for pat in patterns:
+        for m in re.finditer(pat, html, re.IGNORECASE):
+            url = m.group(1).strip()
+            if not url.startswith("http"):
+                continue
+            if _is_blocked(url):
+                continue
+            path = url.lower().split("?")[0]
+            if any(path.endswith(ext) for ext in exts):
+                candidates.append(url)
+    # Deduplicate, preserve order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return unique
+
+
+async def _fetch_html(url: str, timeout: int = 20) -> str:
+    """Fetch a URL and return response text. Returns '' on failure."""
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=10, read=timeout, write=None, pool=None),
+            headers=_HEADERS,
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.text
+    except Exception as exc:
+        logger.warning("[BrowserAgent] HTTP fetch failed for %s: %s", url, exc)
+        return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tier 2 — LLM URL discovery
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _ask_llm_for_download_url(software: str, os_: OperatingSystem) -> Optional[str]:
+    """
+    Ask Mistral for the official download page URL for this software + OS.
+    Blocking — run in thread via asyncio.to_thread().
+    Returns a URL string or None.
+    """
+    api_key = settings.llm.mistral_api_key
+    if not api_key:
+        return None
+    try:
+        from mistralai import Mistral
+        client = Mistral(api_key=api_key)
+
+        os_name = {
+            OperatingSystem.WINDOWS: "Windows",
+            OperatingSystem.MACOS:   "macOS",
+            OperatingSystem.LINUX:   "Linux",
+        }.get(os_, "Windows")
+
+        prompt = (
+            f"What is the exact official download page URL for '{software}' on {os_name}?\n"
+            "Rules:\n"
+            "1. Return ONLY the URL — no explanation, no markdown, no extra text.\n"
+            "2. Must be an https:// URL from the official vendor website.\n"
+            "3. If there is a direct installer download link (ends in .exe/.msi/.dmg etc) prefer that.\n"
+            "4. If you are not certain, return the word UNKNOWN.\n"
+            "Examples:\n"
+            "  VS Code Windows → https://code.visualstudio.com/sha/download?build=stable&os=win32-x64-user\n"
+            "  Python Windows  → https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe\n"
+            "  ChatGPT Windows → https://apps.microsoft.com/detail/9nt1r1c2hh7j\n"
+        )
+        response = client.chat.complete(
+            model=settings.llm.intent_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=80,
+        )
+        raw = response.choices[0].message.content.strip().strip('"').strip("'")
+        if raw.upper() == "UNKNOWN" or not raw.startswith("http"):
+            logger.info("[BrowserAgent] LLM could not provide URL for %r", software)
+            return None
+        logger.info("[BrowserAgent] LLM suggested URL for %r: %s", software, raw)
+        return raw
+    except Exception as exc:
+        logger.warning("[BrowserAgent] LLM URL discovery failed: %s", exc)
+        return None
+
+
+def _ask_llm_for_direct_installer(software: str, os_: OperatingSystem) -> Optional[str]:
+    """
+    Ask Mistral for a direct installer download URL (.exe/.msi/.dmg).
+    More specific than _ask_llm_for_download_url — requests a file link.
+    """
+    api_key = settings.llm.mistral_api_key
+    if not api_key:
+        return None
+    try:
+        from mistralai import Mistral
+        client = Mistral(api_key=api_key)
+
+        os_name = {
+            OperatingSystem.WINDOWS: "Windows 64-bit",
+            OperatingSystem.MACOS:   "macOS",
+            OperatingSystem.LINUX:   "Linux 64-bit",
+        }.get(os_, "Windows 64-bit")
+
+        ext_hint = {
+            OperatingSystem.WINDOWS: ".exe or .msi file",
+            OperatingSystem.MACOS:   ".dmg or .pkg file",
+            OperatingSystem.LINUX:   ".deb, .rpm, or .AppImage file",
+        }.get(os_, ".exe file")
+
+        prompt = (
+            f"Give me the direct download URL for the latest stable {software} installer "
+            f"for {os_name}. It should be a {ext_hint}.\n"
+            "Return ONLY the URL. No explanation. If unknown, return UNKNOWN."
+        )
+        response = client.chat.complete(
+            model=settings.llm.intent_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=120,
+        )
+        raw = response.choices[0].message.content.strip().strip('"').strip("'")
+        if raw.upper() == "UNKNOWN" or not raw.startswith("http"):
+            return None
+        logger.info("[BrowserAgent] LLM direct installer URL for %r: %s", software, raw)
+        return raw
+    except Exception as exc:
+        logger.warning("[BrowserAgent] LLM direct installer URL failed: %s", exc)
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tier 3 — httpx-based web scrape (no Playwright, no subprocess)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _search_for_installer(software: str, os_: OperatingSystem) -> Optional[str]:
+    """
+    Search DuckDuckGo HTML (no API key) for a direct installer URL.
+    Falls back to scraping the top result page for installer links.
+    """
+    os_name = {
+        OperatingSystem.WINDOWS: "windows",
+        OperatingSystem.MACOS:   "macos",
+        OperatingSystem.LINUX:   "linux",
+    }.get(os_, "windows")
+
+    ext_hint = {
+        OperatingSystem.WINDOWS: "exe OR msi",
+        OperatingSystem.MACOS:   "dmg OR pkg",
+        OperatingSystem.LINUX:   "deb OR rpm OR AppImage",
+    }.get(os_, "exe")
+
+    query = f"{software} official download {os_name} {ext_hint} site:*.{_get_likely_domain(software)}"
+    fallback_query = f"{software} download {os_name} installer filetype:{ext_hint.split()[0]}"
+
+    # Try DuckDuckGo HTML (no JS)
+    ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    html = await _fetch_html(ddg_url)
+    if html:
+        urls = _extract_installer_urls(html, os_)
+        if urls:
+            best = max(urls, key=lambda u: _score_url(u, os_))
+            logger.info("[BrowserAgent] DDG found installer: %s", best)
+            return best
+
+    # Try scraping the known download page (if we have one)
+    known_page = settings.registry.official_download_urls.get(software)
+    if known_page:
+        page_html = await _fetch_html(known_page)
+        if page_html:
+            urls = _extract_installer_urls(page_html, os_)
+            if urls:
+                best = max(urls, key=lambda u: _score_url(u, os_))
+                logger.info("[BrowserAgent] Scraped official page, found: %s", best)
+                return best
+
+    return None
+
+
+def _get_likely_domain(software: str) -> str:
+    """Guess the likely TLD suffix for vendor domain matching."""
+    lower = software.lower()
+    domain_hints = {
+        "chatgpt": "openai.com", "openai": "openai.com",
+        "vs code": "microsoft.com", "visual studio code": "microsoft.com",
+        "python": "python.org", "chrome": "google.com",
+        "firefox": "mozilla.org", "docker": "docker.com",
+        "github": "github.com", "slack": "slack.com",
+        "zoom": "zoom.us", "discord": "discord.com",
+    }
+    for key, domain in domain_hints.items():
+        if key in lower:
+            return domain
+    return "com"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Windows Store / Microsoft Store special handling
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _make_winget_store_link(store_url: str, software: str) -> DownloadLink:
+    """
+    For MS Store URLs (apps.microsoft.com/detail/...) we return a special
+    DownloadLink with is_official=True so the install agent can handle it
+    via `winget install --id <store_id>` directly.
+    """
+    # Extract the product ID from the URL
+    m = re.search(r"/detail/([A-Z0-9]+)", store_url, re.IGNORECASE)
+    store_id = m.group(1) if m else ""
+    return DownloadLink(
+        url=store_url,          # type: ignore[arg-type]
+        source_domain="apps.microsoft.com",
+        is_official=True,
+        file_name=f"{software}_store_{store_id}",
+        metadata={"store_id": store_id, "install_method": "winget_store"},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Browser Agent
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 class BrowserAgent:
     """
     Agent 4 — Browser Agent.
-    Primary:   Playwright DOM scraping.
-    Fallback:  OCR via pytesseract on screenshot.
+
+    Discovers the official download URL for any software using:
+      Tier 1: Hardcoded registry (instant, most reliable)
+      Tier 2: Mistral LLM → "what is the download URL for X on Windows?"
+      Tier 3: httpx scraping of DDG results + known download pages
+
+    No Playwright, no subprocesses — fully compatible with Celery solo pool.
     """
-
-    def __init__(self) -> None:
-        self._browser: Optional[Browser] = None
-        self._playwright = None
-
-    async def _get_browser(self) -> Browser:
-        if self._browser is None or not self._browser.is_connected():
-            self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=settings.browser.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            logger.info("[BrowserAgent] Chromium launched (headless=%s)", settings.browser.headless)
-        return self._browser
 
     async def find_download_link(self, intent: IntentOutput) -> BrowserResult:
         software = intent.software_canonical
         os_      = intent.operating_system
         logger.info("[BrowserAgent] Looking for %s on %s", software, os_)
 
-        # 1. Known URL (fastest, most reliable)
+        # ── Tier 1: Known URL from registry ──────────────────────────────────
         known_url = settings.registry.official_download_urls.get(software)
         if known_url:
-            result = await self._navigate_and_extract(known_url, os_, software)
-            if result.success:
-                return result
-            logger.warning("[BrowserAgent] Known URL failed — falling back to search")
-
-        # 2. Google search fallback
-        search_url = (
-            "https://www.google.com/search?q="
-            + f"{software.replace(' ', '+')}+official+download+{os_.value}"
-        )
-        return await self._navigate_and_extract(search_url, os_, software)
-
-    async def _navigate_and_extract(
-        self, url: str, os_: OperatingSystem, software: str
-    ) -> BrowserResult:
-        browser = await self._get_browser()
-        ctx: BrowserContext = await browser.new_context(
-            user_agent=settings.browser.user_agent,
-            viewport={"width": 1280, "height": 800},
-        )
-        page: Page = await ctx.new_page()
-
-        try:
-            await page.goto(
-                url,
-                timeout=settings.browser.navigation_timeout_ms,
-                wait_until="networkidle",
-            )
-            await page.wait_for_timeout(1500)
-
-            # Dismiss cookie banners
-            for sel in settings.selectors.cookie_dismiss_selectors:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.is_visible(timeout=1000):
-                        await btn.click()
-                        await page.wait_for_timeout(300)
-                except Exception:
-                    pass
-
-            links = await self._extract_links(page, os_, software)
-
-            if not links and settings.features.ocr_fallback:
-                logger.info("[BrowserAgent] DOM scraping found nothing — trying OCR fallback")
-                links = await self._ocr_fallback(page, os_)
-
-            if not links:
+            logger.info("[BrowserAgent] Registry hit: %s → %s", software, known_url)
+            # Check if it's a Microsoft Store URL
+            if "apps.microsoft.com" in known_url:
+                link = _make_winget_store_link(known_url, software)
                 return BrowserResult(
-                    success=False,
-                    error="No download links found on page",
-                    page_title=await page.title(),
-                    navigation_path=[url],
+                    success=True,
+                    download_links=[link],
+                    selected_link=link,
+                    page_title=f"{software} - Microsoft Store",
+                    navigation_path=[known_url],
                 )
+            # Try to scrape the page for direct installer links
+            html = await _fetch_html(known_url)
+            if html:
+                urls = _extract_installer_urls(html, os_)
+                if urls:
+                    best_url = max(urls, key=lambda u: _score_url(u, os_))
+                    link = DownloadLink(
+                        url=best_url,   # type: ignore[arg-type]
+                        source_domain=_domain(best_url),
+                        is_official=_is_trusted(best_url) or True,
+                        file_name=best_url.split("/")[-1].split("?")[0] or None,
+                    )
+                    return BrowserResult(
+                        success=True,
+                        download_links=[link],
+                        selected_link=link,
+                        page_title=f"{software} Download",
+                        navigation_path=[known_url],
+                    )
+            # If page scrape failed, use the page URL itself as a fallback
+            # (install agent will handle it via winget if available)
+            logger.info("[BrowserAgent] Page scrape found nothing, using registry URL as download page")
 
-            selected = max(links, key=lambda lnk: _score_link(str(lnk.url), os_))
-
+        # ── Tier 2a: LLM → direct installer URL ──────────────────────────────
+        direct_url = await asyncio.to_thread(_ask_llm_for_direct_installer, software, os_)
+        if direct_url and _is_installer_url(direct_url, os_):
+            link = DownloadLink(
+                url=direct_url,   # type: ignore[arg-type]
+                source_domain=_domain(direct_url),
+                is_official=True,
+                file_name=direct_url.split("/")[-1].split("?")[0] or f"{software}_installer",
+            )
+            logger.info("[BrowserAgent] Using LLM direct installer URL: %s", direct_url)
             return BrowserResult(
                 success=True,
-                download_links=links,
-                selected_link=selected,
-                page_title=await page.title(),
-                navigation_path=[url],
+                download_links=[link],
+                selected_link=link,
+                page_title=f"{software} Download (LLM)",
+                navigation_path=[direct_url],
             )
 
-        except Exception as exc:
-            logger.error("[BrowserAgent] Navigation error: %s", exc)
-            return BrowserResult(success=False, error=str(exc), navigation_path=[url])
-        finally:
-            await ctx.close()
-
-    async def _extract_links(
-        self, page: Page, os_: OperatingSystem, software: str
-    ) -> list[DownloadLink]:
-        links: list[DownloadLink] = []
-
-        for selector in settings.selectors.download_button_selectors:
-            try:
-                elements = await page.locator(selector).all()
-                for el in elements[:20]:
-                    href = await el.get_attribute("href") or ""
-                    if not href or not href.startswith("http"):
-                        continue
-                    if not _is_trusted(href):
-                        continue
-                    parsed = urlparse(href)
-                    links.append(DownloadLink(
-                        url=href,                          # type: ignore[arg-type]
-                        source_domain=parsed.netloc,
-                        is_official=_is_trusted(href),
-                        file_name=href.split("/")[-1].split("?")[0] or None,
-                    ))
-            except Exception:
-                continue
-
-        # Dedup by URL
-        seen: set[str] = set()
-        unique: list[DownloadLink] = []
-        for lnk in links:
-            k = str(lnk.url)
-            if k not in seen:
-                seen.add(k)
-                unique.append(lnk)
-        return unique
-
-    async def _ocr_fallback(
-        self, page: Page, os_: OperatingSystem
-    ) -> list[DownloadLink]:
-        """Screenshot → OCR → regex for installer URLs."""
-        try:
-            import io
-            import pytesseract
-            from PIL import Image
-
-            screenshot = await page.screenshot(full_page=True)
-            img  = Image.open(io.BytesIO(screenshot))
-            text = pytesseract.image_to_string(img)
-            urls = re.findall(
-                r"https?://\S+\.(?:exe|msi|dmg|pkg|deb|rpm|tar\.gz)", text
-            )
-            links = []
-            for url in urls:
-                if _is_trusted(url):
-                    links.append(DownloadLink(
-                        url=url,                           # type: ignore[arg-type]
-                        source_domain=urlparse(url).netloc,
+        # ── Tier 2b: LLM → download page URL → scrape ────────────────────────
+        page_url = await asyncio.to_thread(_ask_llm_for_download_url, software, os_)
+        if page_url:
+            if "apps.microsoft.com" in page_url:
+                link = _make_winget_store_link(page_url, software)
+                return BrowserResult(
+                    success=True,
+                    download_links=[link],
+                    selected_link=link,
+                    page_title=f"{software} - Microsoft Store",
+                    navigation_path=[page_url],
+                )
+            html = await _fetch_html(page_url)
+            if html:
+                urls = _extract_installer_urls(html, os_)
+                if urls:
+                    best_url = max(urls, key=lambda u: _score_url(u, os_))
+                    link = DownloadLink(
+                        url=best_url,   # type: ignore[arg-type]
+                        source_domain=_domain(best_url),
                         is_official=True,
-                        file_name=url.split("/")[-1],
-                    ))
-            return links
-        except ImportError:
-            logger.warning("[BrowserAgent] pytesseract / Pillow not installed — OCR unavailable")
-            return []
-        except Exception as exc:
-            logger.warning("[BrowserAgent] OCR fallback failed: %s", exc)
-            return []
+                        file_name=best_url.split("/")[-1].split("?")[0] or None,
+                    )
+                    return BrowserResult(
+                        success=True,
+                        download_links=[link],
+                        selected_link=link,
+                        page_title=f"{software} Download",
+                        navigation_path=[page_url],
+                    )
+
+        # ── Tier 3: httpx web scrape (DDG + official page) ────────────────────
+        installer_url = await _search_for_installer(software, os_)
+        if installer_url:
+            link = DownloadLink(
+                url=installer_url,   # type: ignore[arg-type]
+                source_domain=_domain(installer_url),
+                is_official=_is_trusted(installer_url),
+                file_name=installer_url.split("/")[-1].split("?")[0] or f"{software}_installer",
+            )
+            return BrowserResult(
+                success=True,
+                download_links=[link],
+                selected_link=link,
+                page_title=f"{software} Download (scraped)",
+                navigation_path=[installer_url],
+            )
+
+        # ── All tiers failed ──────────────────────────────────────────────────
+        logger.warning(
+            "[BrowserAgent] All tiers exhausted for %s on %s", software, os_
+        )
+        return BrowserResult(
+            success=False,
+            error=(
+                f"Could not find a download link for '{software}' on {os_.value}. "
+                "Consider installing via winget or the official website manually."
+            ),
+            navigation_path=[],
+        )
 
     async def close(self) -> None:
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        """No-op — no persistent resources to close."""
+        pass

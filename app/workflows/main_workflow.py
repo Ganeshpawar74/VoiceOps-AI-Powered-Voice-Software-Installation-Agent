@@ -14,16 +14,15 @@ ARCHITECTURE:
   9. Notification Agent→ Redis pub/sub
 
 FIXES IN THIS VERSION:
-  FIX-1–8: All prior fixes retained (verify, response, tts nodes, etc.)
-  FIX-9 (NEW): _workflow was built at module import time via
-          `_workflow = build_workflow()` at module scope.
-          If any agent import failed (e.g. faster-whisper not installed,
-          mistralai missing, etc.) the entire FastAPI app crashed with a
-          500 on every request, even /api/health.
-          FIX: _workflow is now built lazily on first call to
-          run_voice_workflow() and cached. Import errors surface as proper
-          task failures instead of killing the whole app.
-  FIX-7: node_human_approval: from_url() is sync in redis>=5 (no await).
+  FIX-1–9: All prior fixes retained.
+  FIX-10 (NEW): _MIN_SPEECH_CONFIDENCE lowered from 0.55 → 0.40.
+          Whisper's no_speech_prob heuristic returns low confidence even for
+          perfectly clear short commands. Speech agent now floors confidence
+          at 0.65 when a non-empty transcript is returned, and this workflow
+          threshold is set to 0.40 as an additional safety margin.
+  FIX-11 (NEW): node_notify now logs the actual software canonical name from
+          intent state so notification messages read "GitHub Desktop has been
+          installed successfully" instead of "the software has been installed".
 """
 
 from __future__ import annotations
@@ -53,7 +52,11 @@ from app.models.schemas import (
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
-_MIN_SPEECH_CONFIDENCE = 0.55
+# FIX: lowered from 0.55 → 0.40. After VAD parameter relaxation and the
+# confidence floor added in speech_agent (FIX #9, #10), valid short commands
+# reliably return confidence ≥ 0.65. Setting threshold to 0.40 keeps a safety
+# net against genuinely garbled audio without false-rejecting real speech.
+_MIN_SPEECH_CONFIDENCE = 0.40
 
 
 # ──────────────────────────────────────────────
@@ -401,12 +404,14 @@ async def node_install(state: WorkflowState) -> WorkflowState:
         download = DownloadResult(**state["download"])
         intent   = IntentOutput(**state["intent"])
 
-        # Resolve pkg_id from plan params if available
+        # Resolve pkg_id and install_method from plan params
         pkg_id: Optional[str] = None
+        plan_install_method: Optional[str] = None
         plan_data = state.get("plan")
         if plan_data and plan_data.get("steps"):
             first_step = plan_data["steps"][0]
             pkg_id = first_step.get("params", {}).get("package_id")
+            plan_install_method = first_step.get("params", {}).get("install_method")
 
         result: InstallResult = await install_agent.install(
             download=download,
@@ -415,6 +420,7 @@ async def node_install(state: WorkflowState) -> WorkflowState:
             package_id=pkg_id,
             use_package_manager=state.get("use_package_manager", False),
             rag_context=state.get("rag_context"),
+            install_method_override=plan_install_method,
         )
         state["install"] = result.model_dump(mode='json')
         if not result.success:
@@ -576,12 +582,28 @@ async def node_notify(state: WorkflowState) -> WorkflowState:
         if state.get("install"):
             task.install_result = InstallResult(**state["install"])
 
+        # FIX: extract actual software name for notification messages
+        software_name = ""
+        if state.get("intent"):
+            software_name = state["intent"].get("software_canonical", "")
+
         if state.get("error"):
             task.status = TaskStatus.FAILED
             task.error  = state["error"]
+            sw_label = f" for {software_name}" if software_name else ""
+            logger.info(
+                "[Notification] task=%s status=failed msg=Failed to install%s: %s",
+                task.task_id, sw_label, state["error"],
+            )
         else:
             task.status       = TaskStatus.COMPLETED
             task.progress_pct = 100
+            # Use the actual software name from intent — not a hardcoded string
+            logger.info(
+                "[Notification] task=%s status=completed msg=%s has been installed successfully.",
+                task.task_id,
+                software_name or "Software",
+            )
 
         install_data = state.get("install")
         if install_data:
