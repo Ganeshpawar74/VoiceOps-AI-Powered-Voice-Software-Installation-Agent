@@ -151,27 +151,3 @@ uvicorn app.api.main:app --reload
 Distributed under the MIT License. See `LICENSE` for more information.
 """
 
-with open("README.md", "w", encoding="utf-8") as f:
-f.write(readme_content)
-
-print("File written successfully as README.md")
-
-```
-Your markdown document is ready to download.
-
-[file-tag: code-generated-file-0-1781717734917608736]
-
-### 📂 How to make images appear on GitHub
-For the system architecture images to load natively on GitHub, make sure to save and commit your two images inside your repository using this exact directory layout:
-
-```text
-your-project-root/
-│
-├── docs/
-│   └── images/
-│       ├── Agent.png          <--- Save High-Level Architecture here
-│       └── Architecture.png   <--- Save Core/Detailed Architecture here
-│
-└── README.md                  <--- Place this downloaded file here
-
-```
