@@ -1,7 +1,4 @@
-```python
-import os
-
-readme_content = """# VoiceOps — AI-Powered Voice Software Installation Agent
+# VoiceOps — AI-Powered Voice Software Installation Agent
 
 > **Speak a command → AI automates the entire software research, download, installation, and verification loop.**
 
