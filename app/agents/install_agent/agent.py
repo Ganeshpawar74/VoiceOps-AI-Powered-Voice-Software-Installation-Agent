@@ -1,25 +1,6 @@
 """
-InstallAgent — Executes installations and captures all output/errors.
+InstallAgent 
 
-Root causes fixed:
-  1. install() signature mismatch — main_workflow calls install(download=...,
-     software=..., os_target=..., use_package_manager=..., rag_context=...)
-     but the original accepted only (software_canonical, winget_id).
-     Every install attempt crashed with TypeError before running a single command.
-  2. install() was synchronous but main_workflow awaits it — wrapped subprocess
-     call in asyncio.to_thread so the event loop stays free during install.
-  3. InstallResult was a local dataclass, incompatible with the schemas.InstallResult
-     Pydantic model. Now the agent imports and returns schemas.InstallResult directly.
-  4. success=false, error="" — winget ran but error output was never captured.
-  5. Winget on Windows AppInstaller path requires --accept-* flags.
-  6. No timeout → added TIMEOUT_SEC = 300.
-  7. Exit code mapping missing.
-  8. Logs list populated but never surfaced to caller.
-  9. Missing: version extraction from winget stdout.
-
-  NEW FIX: `package_id` lookup now falls through from plan params → _WINGET_IDS
-           map → settings registry, so the agent is never dependent on the planner
-           having hard-coded the exact package ID.
 """
 
 from __future__ import annotations

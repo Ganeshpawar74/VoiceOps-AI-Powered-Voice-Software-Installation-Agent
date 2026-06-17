@@ -1,8 +1,6 @@
 """
 Agent 7 — MonitoringAgent  /  Agent 8 — NotificationAgent
-FIXES:
-  BUG #3: await aioredis.from_url() removed (same as task_store).
-  BUG #4: hasattr(task, 'intent_output') replaced with value-level check.
+
 """
 from __future__ import annotations
 import asyncio, logging

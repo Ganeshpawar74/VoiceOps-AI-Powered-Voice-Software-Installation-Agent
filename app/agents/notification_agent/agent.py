@@ -1,20 +1,6 @@
 """
 NotificationAgent — Delivers progress/completion notifications to users.
 
-Root cause fixed:
-  "Event loop is closed" error happens because:
-  - The notification agent used asyncio.run() or awaited coroutines
-    inside a Celery task running in --pool=solo (synchronous) mode.
-  - Celery's solo pool runs everything synchronously; calling asyncio.run()
-    inside a task that itself may be called from within an existing loop
-    (e.g. FastAPI → Celery task chain) causes "Event loop is closed".
-
-Fix:
-  - NotificationAgent is now fully SYNCHRONOUS.
-  - For any genuinely async delivery (WebSocket, SSE), we use
-    asyncio.run() ONLY if no running loop exists, otherwise schedule
-    via run_coroutine_threadsafe.
-  - Redis pub/sub notification is synchronous and preferred for Celery tasks.
 """
 
 from __future__ import annotations

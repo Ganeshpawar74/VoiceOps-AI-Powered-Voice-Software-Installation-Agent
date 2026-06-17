@@ -1,26 +1,6 @@
 """
 Agent 2 — Intent Agent
-Extracts software install intent from a SpeechOutput using Mistral AI.
 
-Root causes fixed vs original:
-  1. extract() was SYNCHRONOUS but main_workflow calls `await _intent_agent.extract(speech)`.
-     → Made fully async; Mistral API call wrapped in asyncio.to_thread.
-  2. IntentAgent.__init__ required api_key parameter but workflow called IntentAgent()
-     with no arguments → TypeError on every startup.
-     → api_key now read from settings.llm.mistral_api_key; no constructor arg needed.
-  3. Model name was hardcoded "mistral-small-latest" ignoring settings.llm.intent_model.
-     → Now reads settings.llm.intent_model.
-  4. extract() accepted a raw string but workflow passes a SpeechOutput object.
-     → Signature changed to accept SpeechOutput; query extracted inside.
-  5. _parse() could silently return UNKNOWN if the LLM returned a valid-looking intent
-     string that wasn't in the Intent enum (e.g. "install" instead of "install_software").
-     → Added graceful fallback with a logged warning.
-  6. Hinglish keywords were checked in the original but intent prompt system message
-     was not injected with the full alias list from settings.registry.software_aliases.
-     → Alias map now sourced from settings, not a hardcoded dict.
-  7. Mistral client initialisation happened at __init__ time, causing import-time
-     failures if the API key env var was not yet loaded.
-     → Client initialised lazily on first call.
 """
 
 from __future__ import annotations

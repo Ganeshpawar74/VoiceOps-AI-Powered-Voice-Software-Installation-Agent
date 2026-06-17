@@ -1,21 +1,6 @@
 """
 VoiceOps FastAPI Application
 
-BUGS FIXED IN THIS FILE:
-  BUG-API-1: TextCommandRequest.os_hint is Optional[OperatingSystem] (an Enum),
-             but the API was calling req.os_hint.value without guarding for None,
-             causing AttributeError -> 500 when no os_hint is supplied.
-             FIX: guard with `req.os_hint.value if req.os_hint else None`.
-             (This was already in the file but the guard was missing upstream from
-              os_hint reaching _dispatch_text in some code paths.)
-
-  BUG-API-2: Global exception handler swallows ASGI lifecycle exceptions silently.
-             FIX: log full traceback before returning JSON error.
-
-  BUG-API-3: _run_text_workflow_inprocess passes os_hint (a str or None) directly
-             but run_voice_workflow signature expects Optional[str].  Safe.
-
-  All prior fixes from previous patches are retained.
 """
 
 from __future__ import annotations
