@@ -1,20 +1,6 @@
 """
 Agent 6b — Verify Agent (NEW — per architecture diagram)
 
-After install completes, independently verifies the software is actually installed
-by checking:
-  Windows  : `winget list --id <pkg>` + `where <exe>` + `<exe> --version`
-  macOS    : `brew list <formula>` + `/Applications/<App>.app` existence
-  Linux    : `dpkg -l <pkg>` / `snap list <pkg>` + `which <exe>`
-
-Returns VerifyResult (Pydantic model).
-All subprocess calls wrapped in asyncio.to_thread — never blocks the event loop.
-
-FIXES:
-  BUG #8: _verify_windows winget check used pkg_id.split(".")[-1] ("Postman") but
-          winget list output contains the display name, not the package ID segment.
-          Fix: search for the full pkg_id string in output (case-insensitive),
-          then fall through to `where <exe>` which is more reliable on Windows.
 """
 from __future__ import annotations
 
@@ -52,20 +38,13 @@ def _run(cmd: list[str]) -> tuple[int, str, str]:
 def _verify_windows(software: str, pkg_id: Optional[str]) -> tuple[bool, str, Optional[str]]:
     """Returns (found, method, version_string)."""
     # 1. winget list --id <pkg_id>
-    #    BUG #8 FIX: old code checked `pkg_id.split(".")[-1].lower() in out.lower()`
-    #    e.g. "postman" in the output. But winget list output looks like:
-    #      Name     Id               Version  Source
-    #      Postman  Postman.Postman  12.15.5  winget
-    #    The full pkg_id ("Postman.Postman") is present, so search for that instead.
-    #    Also guard against winget returning rc=0 but "No installed package found".
+    #    BUG 
     if pkg_id:
         rc, out, _ = _run(["winget", "list", "--id", pkg_id, "--accept-source-agreements"])
         if rc == 0 and pkg_id.lower() in out.lower() and "no installed" not in out.lower():
             version = _extract_version(out)
             return True, "winget_list", version
 
-    # 2. `where <exe>` — reliable on Windows PATH. Candidate exe names are
-    #    derived dynamically from the software name (no hardcoded per-app map).
     exe_candidates = _exe_names(software, pkg_id)
     for exe in exe_candidates:
         rc, out, _ = _run(["where", exe])

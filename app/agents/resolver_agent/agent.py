@@ -1,33 +1,6 @@
 """
 Agent — SoftwareResolverAgent  (NEW)
 
-Replaces every hardcoded software dict (_WINGET_IDS, winget_packages,
-software_aliases, brew_packages, apt_packages, snap_packages, ...) with a
-single Gen-AI-based resolution pipeline:
-
-    user free-text software name
-        |
-        v
-    1. winget search "<name>"      <-- ground truth: what's ACTUALLY installable
-        |
-        v
-    2. If exactly one strong match -> use it directly, no LLM needed.
-       If zero or many ambiguous matches -> ask the LLM to pick the best
-       candidate id from the *actual* search results (never invent one).
-        |
-        v
-    3. Cache the resolved (query -> package_id) pair in Redis for 30 days
-       so repeated requests for the same software are instant and don't
-       re-spend an LLM call. The cache is just a performance layer — the
-       system never trusts a cached id without it having come from a real
-       winget search at some point.
-
-This means: no app-specific code, no per-app dict entries, no "if software
-== 'chatgpt'" branches anywhere. Any software winget knows about resolves
-correctly the first time a user asks for it, automatically.
-
-For macOS / Linux the same shape is used against `brew search` / `apt-cache
-search` / `snap find` respectively.
 """
 
 from __future__ import annotations

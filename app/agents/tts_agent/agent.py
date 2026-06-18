@@ -1,11 +1,6 @@
 """
 Agent 8 — TTS Agent (NEW — per architecture diagram)
 
-Converts the final text response into audio using Sarvam AI TTS.
-Returns base64-encoded WAV bytes so the API can stream it to the browser.
-
-If TTS is disabled (FEATURE_TTS_ENABLED=false) or the Sarvam key is missing,
-returns None gracefully — the caller falls back to text-only response.
 """
 from __future__ import annotations
 

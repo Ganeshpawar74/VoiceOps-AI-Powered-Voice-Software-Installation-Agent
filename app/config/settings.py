@@ -2,11 +2,6 @@
 VoiceOps — Configuration
 All env vars loaded via pydantic-settings.
 
-FIXES IN THIS VERSION:
-  All prior fixes retained.
-  NEW: Added download_to_desktop feature flag and desktop_dir to AppSettings.
-  NEW: Added ChatGPT / OpenAI app to all registries.
-  NEW: Added DuckDuckGo search fallback URL for browser agent.
 """
 from __future__ import annotations
 import os

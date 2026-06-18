@@ -1,23 +1,6 @@
 """
 Agent 7 — MonitoringAgent  /  Agent 8 — NotificationAgent  (REWRITTEN)
 
-WHY THIS WAS REWRITTEN:
-  Both agents previously cached an `aioredis.Redis` client on `self._redis`
-  the first time it was needed, and the agent instances themselves were
-  process-wide singletons in main_workflow.py. Since the underlying asyncio
-  Redis client binds internally to whichever event loop is running at
-  connection time, and Celery (via `asyncio.run()` per task) creates a
-  BRAND NEW event loop per task, every task after the first one reused a
-  Redis client tied to an already-closed loop. That's the root cause of:
-
-      [Notification] Redis publish skipped: Event loop is closed
-
-  FIX: never cache the Redis client across calls. Each publish/get
-  operation opens a connection, uses it, and closes it within the SAME
-  call (and therefore the same event loop). This costs a small amount of
-  per-call connection overhead but completely eliminates cross-loop reuse.
-  (main_workflow.py additionally constructs these agents fresh per
-  workflow run as a second layer of safety — belt and suspenders.)
 """
 from __future__ import annotations
 import asyncio, logging

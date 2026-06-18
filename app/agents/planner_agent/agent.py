@@ -1,24 +1,6 @@
 """
 Agent 3 — Planner Agent (LangGraph Plan-and-Execute)  (REWRITTEN)
 
-WHY THIS WAS REWRITTEN:
-  The previous version resolved package IDs via `_get_local_pkg_id()`, which
-  looked things up in hardcoded dicts (`settings.registry.winget_packages`,
-  `brew_packages`, `apt_packages`, `snap_packages`) before ever falling back
-  to anything dynamic. That meant the vast majority of real-world software
-  requests (anything not already in those ~30-40-entry dicts) silently
-  fell through to the slow/unreliable browser-scraping path.
-
-NEW DESIGN:
-  All package-id resolution is delegated to SoftwareResolverAgent, which
-  queries the LIVE package manager (winget search / brew search / apt-cache
-  search / snap find) as ground truth, using an LLM only to disambiguate
-  among real results or to clean up a noisy search term. No hardcoded
-  per-app dictionaries are consulted anywhere in this file.
-
-  download_only intent now also produces a real, executable step (download
-  the installer file to Desktop via the package manager's native "download"
-  command) instead of a no-op marker — see _download_only_steps().
 """
 from __future__ import annotations
 

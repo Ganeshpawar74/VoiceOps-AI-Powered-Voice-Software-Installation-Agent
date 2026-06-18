@@ -1,28 +1,6 @@
 """
 Agent 2 — Intent Agent  (REWRITTEN — fully Gen-AI based, no hardcoded dicts)
 
-WHY THIS WAS REWRITTEN:
-  The previous version maintained a hand-written `_TRANSCRIPTION_FIXES` list
-  mapping specific mis-heard phrases ("chat gpd" -> "chatgpt", "be escort" ->
-  "vs code", ...) and relied on `settings.registry.software_aliases`, a
-  hardcoded dict of ~60 software names. Both are static, app-specific, and
-  do not scale: any software not already in the dict (the vast majority of
-  real-world requests) fell through to a weaker path.
-
-NEW DESIGN:
-  1. No phonetic fix dict. No alias dict dependency for matching.
-  2. A single LLM call extracts BOTH intent and the raw software name the
-     user said, instructed to reconstruct likely STT errors using general
-     language knowledge (not a static lookup table).
-  3. The LLM is explicitly told NOT to normalise the software name to any
-     "canonical" form — software identity resolution against real,
-     installable packages is the SoftwareResolverAgent's job (it queries
-     live package-manager search, so it can never hallucinate a package).
-  4. A lightweight rule-based fast path still exists for clear-cut intent
-     verbs ("install", "download", "uninstall", "download karo", ...) to
-     avoid an LLM round-trip on speech that's already unambiguous — this is
-     intent-VERB detection only, not a software dictionary, so it scales to
-     any software automatically.
 """
 
 from __future__ import annotations

@@ -1,24 +1,6 @@
 """
 Agent 6 — Install Agent  (REWRITTEN)
 
-WHY THIS WAS REWRITTEN:
-  The previous version maintained `_WINGET_IDS`, a hardcoded dict of ~50
-  software-name -> winget-package-id entries, plus an LLM fallback
-  (`_discover_winget_id_via_llm`) that could hallucinate a package id with
-  NO verification it actually existed. Package ID resolution now happens
-  entirely upstream in SoftwareResolverAgent (which validates every id
-  against a live `winget search` / `brew search` / `apt-cache search`
-  result before it ever reaches this agent) — this agent's job is purely
-  EXECUTION: given an already-resolved, already-validated package id, run
-  the actual install or download command and report what really happened.
-
-  NEW: a genuine download_only execution path. Previously "download X"
-  intent never reached this agent at all (main_workflow faked a
-  `__use_package_manager__` marker and skipped straight to a canned
-  success response). Now `download_only()` actually runs
-  `winget download --download-directory <Desktop>` (or the brew/apt/snap
-  equivalent metadata) and leaves a real installer file on the user's
-  Desktop, without executing it.
 """
 
 from __future__ import annotations

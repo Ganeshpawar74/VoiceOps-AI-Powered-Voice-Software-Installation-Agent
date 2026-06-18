@@ -1,25 +1,6 @@
 """
 Agent 4 — Browser Agent  (Playwright-free, Celery-safe)
 
-ROOT CAUSE OF ORIGINAL FAILURES:
-  Playwright's async_playwright().start() calls asyncio.create_subprocess_exec()
-  internally. Celery's --pool=solo on Windows uses a ProactorEventLoop that does
-  NOT support subprocess creation inside an already-running coroutine, hence:
-      NotImplementedError at asyncio/base_events.py _make_subprocess_transport
-
-SOLUTION — Three-tier download URL discovery (no subprocess, no Playwright):
-  Tier 1 (instant):   settings.registry.official_download_urls  — known URLs
-  Tier 2 (fast):      LLM asks Mistral for the official download page URL.
-                      Works for ANY software the user names, no hardcoding.
-  Tier 3 (fallback):  httpx-based Google/DDG search page scrape for a direct
-                      installer link using regex on the raw HTML.
-
-All three tiers are pure Python + network HTTP — no subprocesses, no headless
-browser, fully compatible with Celery solo/prefork/gevent/eventlet pools on
-Windows and Linux.
-
-The browser_agent's job is: given IntentOutput → return BrowserResult with
-a DownloadLink the download_agent can fetch.
 """
 
 from __future__ import annotations
