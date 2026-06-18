@@ -72,7 +72,11 @@ npm install
 npm run dev
 # Opens at http://localhost:5173
 ```
+```bash
+### Run in Docker (API + Worker) seprate terminal
+celery -A app.services.tasks.celery_app worker --loglevel=info -Q installs --pool=solo
 
+```
 ---
 
 ## Option B — Full Stack with Docker Compose
