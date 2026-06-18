@@ -2,36 +2,47 @@
 # Pin major versions for reproducibility; patch updates are safe.
 
 # ── FastAPI & ASGI ────────────────────────────────────────
-fastapi>=0.111.0,<1.0.0
-uvicorn[standard]>=0.29.0,<1.0.0
+fastapi>=0.111
+uvicorn[standard]>=0.30
 python-multipart>=0.0.9
+starlette>=0.37
+prometheus-client>=0.20
+python-dotenv>=1.0
+PyJWT>=2.8
 
 # ── Pydantic & settings ───────────────────────────────────
-pydantic>=2.7.0,<3.0.0
-pydantic-settings>=2.2.0,<3.0.0
+pydantic>=2.7
+pydantic-settings>=2.2
 
 # ── Database ──────────────────────────────────────────────
 sqlalchemy[asyncio]>=2.0.29,<3.0.0
 asyncpg>=0.29.0              # PostgreSQL async driver
 aiosqlite>=0.20.0            # SQLite fallback (dev/test)
 
-# ── Redis ─────────────────────────────────────────────────
-redis[hiredis]>=5.0.3,<6.0.0
+# --- Background jobs ---
+celery>=5.4
+
+
+# --- Storage / persistence ---
+redis>=5.0
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29           # Postgres driver (DATABASE_URL default)
+aiosqlite>=0.20          # only needed if you point DB_URL at sqlite for local/dev
 
 # ── Celery ────────────────────────────────────────────────
 celery[redis]>=5.3.6,<6.0.0
 flower>=2.0.0,<3.0.0         # Celery web monitor
 
 # ── LangGraph & Mistral ───────────────────────────────────
-langgraph>=0.1.0,<1.0.0
+langgraph>=0.1.5
 langchain-core>=0.2.0,<1.0.0
-mistralai>=1.0.0,<2.0.0
+mistralai>=1.0
 
 # ── STT — faster-whisper ──────────────────────────────────
-faster-whisper>=1.0.0,<2.0.0
-numpy>=1.26.0,<3.0.0
-scipy>=1.13.0,<2.0.0         # resampling (optional but recommended)
-noisereduce>=3.0.0            # audio denoising (optional)
+faster-whisper>=1.0
+numpy>=1.26
+scipy>=1.13
+noisereduce>=3.0           # audio denoising (optional)
 
 # ── Browser automation ────────────────────────────────────
 playwright>=1.43.0,<2.0.0
@@ -50,3 +61,6 @@ pyjwt>=2.8.0,<3.0.0
 # ── Misc ──────────────────────────────────────────────────
 python-dotenv>=1.0.0,<2.0.0
 aiofiles>=23.2.1,<25.0.0
+
+# --- Vector DB (RAG, optional — FEATURE_RAG_ENABLED=false by default) ---
+qdrant-client>=1.9

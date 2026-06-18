@@ -94,9 +94,9 @@ services:
     container_name: voiceops_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: voiceops
-      POSTGRES_PASSWORD: voiceops_secret
-      POSTGRES_DB: voiceops
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -136,7 +136,7 @@ services:
       - voiceops_net
 
   qdrant:
-    image: qdrant/qdrant:v1.9.2
+    image: qdrant/qdrant:latest
     container_name: voiceops_qdrant
     restart: unless-stopped
     volumes:
@@ -363,3 +363,5 @@ networks:
   voiceops_net:
     driver: bridge
     name: voiceops_net
+
+    

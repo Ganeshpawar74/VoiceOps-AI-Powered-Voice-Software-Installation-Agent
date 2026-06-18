@@ -178,47 +178,27 @@ class FeatureFlagSettings(BaseSettings):
 
 
 class SoftwareRegistrySettings(BaseSettings):
+    """
+    NOTE ON THIS REWRITE:
+    `software_aliases`, `winget_packages`, `brew_packages`, and
+    `apt_packages` (previously large hardcoded per-app dictionaries) have
+    been REMOVED. Package identity resolution now happens exclusively via
+    SoftwareResolverAgent, which queries the LIVE package manager
+    (`winget search` / `brew search` / `apt-cache search` / `snap find`) as
+    ground truth and uses the LLM only to disambiguate among real results —
+    so it works for any software automatically, with no per-app entries to
+    maintain.
+
+    `official_download_urls` and `snap_packages` are kept: they are used
+    purely as OPTIONAL fast-path caches in the browser-fallback path (Tier 1
+    of browser_agent's 3-tier discovery) and in verify_agent's snap lookup
+    respectively — both already have working dynamic fallbacks (LLM /
+    `snap list`) when an entry isn't present, so keeping a small cache here
+    is a pure performance optimisation, not a source of truth.
+    """
     model_config = SettingsConfigDict(
         env_prefix="REGISTRY_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
-
-    software_aliases: dict[str, str] = Field(default_factory=lambda: {
-        "vscode": "Visual Studio Code", "vs code": "Visual Studio Code",
-        "visual studio code": "Visual Studio Code", "code": "Visual Studio Code",
-        "python": "Python", "python3": "Python", "py": "Python",
-        "docker": "Docker Desktop", "docker desktop": "Docker Desktop",
-        "postman": "Postman", "chrome": "Google Chrome",
-        "google chrome": "Google Chrome", "firefox": "Mozilla Firefox",
-        "node": "Node.js", "nodejs": "Node.js", "node.js": "Node.js",
-        "git": "Git", "java": "Java JDK", "jdk": "Java JDK",
-        "slack": "Slack", "zoom": "Zoom", "vlc": "VLC Media Player",
-        "7zip": "7-Zip", "7-zip": "7-Zip", "notepad++": "Notepad++",
-        "notepad plus": "Notepad++", "intellij": "IntelliJ IDEA",
-        "pycharm": "PyCharm", "rust": "Rust", "golang": "Go",
-        "go": "Go",
-        "sublime": "Sublime Text", "sublime text": "Sublime Text",
-        "android studio": "Android Studio", "discord": "Discord",
-        "telegram": "Telegram", "obs": "OBS Studio", "obs studio": "OBS Studio",
-        "gimp": "GIMP", "inkscape": "Inkscape", "blender": "Blender",
-        "github": "GitHub Desktop", "github desktop": "GitHub Desktop",
-        "git hub": "GitHub Desktop", "githubdesktop": "GitHub Desktop",
-        "github cli": "GitHub CLI", "gh cli": "GitHub CLI", "gh": "GitHub CLI",
-        "notion": "Notion", "spotify": "Spotify", "figma": "Figma",
-        "anaconda": "Anaconda", "winrar": "WinRAR", "steam": "Steam",
-        "whatsapp": "WhatsApp Desktop", "teams": "Microsoft Teams",
-        "microsoft teams": "Microsoft Teams", "skype": "Skype",
-        "putty": "PuTTY", "filezilla": "FileZilla", "audacity": "Audacity",
-        "handbrake": "HandBrake", "wireshark": "Wireshark",
-        # ChatGPT / OpenAI — many mis-transcription forms
-        "chatgpt": "ChatGPT", "chat gpt": "ChatGPT", "chat g p t": "ChatGPT",
-        "chatgbt": "ChatGPT", "chat gbt": "ChatGPT",
-        "openai": "ChatGPT", "open ai": "ChatGPT",
-        "chad gpt": "ChatGPT", "chat jpt": "ChatGPT",
-    })
-
-    hinglish_keywords: list[str] = Field(default_factory=lambda: [
-        "karo", "chahiye", "lagao", "install karo", "download karo", "chahta"
-    ])
 
     official_download_urls: dict[str, str] = Field(default_factory=lambda: {
         "Visual Studio Code": "https://code.visualstudio.com/Download",
@@ -249,78 +229,7 @@ class SoftwareRegistrySettings(BaseSettings):
         "Java JDK": "https://adoptium.net/temurin/releases/",
         "GitHub Desktop": "https://desktop.github.com/",
         "GitHub CLI": "https://cli.github.com/",
-        # ChatGPT uses Microsoft Store on Windows
         "ChatGPT": "https://apps.microsoft.com/detail/9nt1r1c2hh7j",
-    })
-
-    winget_packages: dict[str, str] = Field(default_factory=lambda: {
-        "Visual Studio Code":  "Microsoft.VisualStudioCode",
-        "Python":              "Python.Python.3.12",
-        "Google Chrome":       "Google.Chrome",
-        "Mozilla Firefox":     "Mozilla.Firefox",
-        "Node.js":             "OpenJS.NodeJS.LTS",
-        "Git":                 "Git.Git",
-        "Docker Desktop":      "Docker.DockerDesktop",
-        "Postman":             "Postman.Postman",
-        "Slack":               "SlackTechnologies.Slack",
-        "Zoom":                "Zoom.Zoom",
-        "7-Zip":               "7zip.7zip",
-        "Notepad++":           "Notepad++.Notepad++",
-        "Discord":             "Discord.Discord",
-        "VLC Media Player":    "VideoLAN.VLC",
-        "OBS Studio":          "OBSProject.OBSStudio",
-        "GIMP":                "GIMP.GIMP",
-        "Blender":             "BlenderFoundation.Blender",
-        "Telegram":            "Telegram.TelegramDesktop",
-        "IntelliJ IDEA":       "JetBrains.IntelliJIDEA.Community",
-        "PyCharm":             "JetBrains.PyCharm.Community",
-        "GitHub Desktop":      "GitHub.GitHubDesktop",
-        "GitHub CLI":          "GitHub.cli",
-        "Spotify":             "Spotify.Spotify",
-        "Notion":              "Notion.Notion",
-        "Figma":               "Figma.Figma",
-        "Steam":               "Valve.Steam",
-        "Audacity":            "Audacity.Audacity",
-        "HandBrake":           "HandBrake.HandBrake",
-        "WinRAR":              "RARLab.WinRAR",
-        "PuTTY":               "PuTTY.PuTTY",
-        "Wireshark":           "WiresharkFoundation.Wireshark",
-        # ChatGPT — winget id for the Microsoft Store app
-        "ChatGPT":             "9NT1R1C2HH7J",
-    })
-
-    brew_packages: dict[str, str] = Field(default_factory=lambda: {
-        "Visual Studio Code":  "visual-studio-code",
-        "Google Chrome":       "google-chrome",
-        "Mozilla Firefox":     "firefox",
-        "Node.js":             "node",
-        "Git":                 "git",
-        "Docker Desktop":      "docker",
-        "Postman":             "postman",
-        "Slack":               "slack",
-        "Zoom":                "zoom",
-        "7-Zip":               "p7zip",
-        "Discord":             "discord",
-        "VLC Media Player":    "vlc",
-        "OBS Studio":          "obs",
-        "GIMP":                "gimp",
-        "Blender":             "blender",
-        "Telegram":            "telegram",
-        "Python":              "python@3.12",
-        "GitHub Desktop":      "github",
-        "GitHub CLI":          "gh",
-        "Spotify":             "spotify",
-    })
-
-    apt_packages: dict[str, str] = Field(default_factory=lambda: {
-        "Git":              "git",
-        "Node.js":          "nodejs",
-        "Python":           "python3",
-        "VLC Media Player": "vlc",
-        "GIMP":             "gimp",
-        "Inkscape":         "inkscape",
-        "Blender":          "blender",
-        "GitHub CLI":       "gh",
     })
 
     snap_packages: dict[str, str] = Field(default_factory=lambda: {

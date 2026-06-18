@@ -292,7 +292,8 @@ async def health(redis: aioredis.Redis = Depends(get_redis)):
         components["redis"] = f"error: {exc}"
     try:
         from app.services import task_store as _ts
-        async with _ts._engine.connect() as conn:
+        engine = _ts._get_engine()
+        async with engine.connect() as conn:
             await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
         components["database"] = "ok"
     except Exception as exc:

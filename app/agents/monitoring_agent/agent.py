@@ -1,6 +1,23 @@
 """
-Agent 7 — MonitoringAgent  /  Agent 8 — NotificationAgent
+Agent 7 — MonitoringAgent  /  Agent 8 — NotificationAgent  (REWRITTEN)
 
+WHY THIS WAS REWRITTEN:
+  Both agents previously cached an `aioredis.Redis` client on `self._redis`
+  the first time it was needed, and the agent instances themselves were
+  process-wide singletons in main_workflow.py. Since the underlying asyncio
+  Redis client binds internally to whichever event loop is running at
+  connection time, and Celery (via `asyncio.run()` per task) creates a
+  BRAND NEW event loop per task, every task after the first one reused a
+  Redis client tied to an already-closed loop. That's the root cause of:
+
+      [Notification] Redis publish skipped: Event loop is closed
+
+  FIX: never cache the Redis client across calls. Each publish/get
+  operation opens a connection, uses it, and closes it within the SAME
+  call (and therefore the same event loop). This costs a small amount of
+  per-call connection overhead but completely eliminates cross-loop reuse.
+  (main_workflow.py additionally constructs these agents fresh per
+  workflow run as a second layer of safety — belt and suspenders.)
 """
 from __future__ import annotations
 import asyncio, logging
@@ -17,21 +34,15 @@ settings = get_settings()
 class MonitoringAgent:
     PROGRESS_CHANNEL = "voiceops:progress:{task_id}"
 
-    def __init__(self):
-        self._redis: Optional[aioredis.Redis] = None
-
-    def _get_redis(self) -> aioredis.Redis:
-        # BUG #3 FIX: no await — from_url is sync in redis>=5
-        if self._redis is None:
-            self._redis = aioredis.from_url(str(settings.redis.url), decode_responses=True)
-        return self._redis
-
     async def publish_progress(self, task_id: str, pct: int, message: str) -> None:
         try:
-            r = self._get_redis()
-            event = NotificationEvent(task_id=task_id, event="progress",
-                                      message=message, data={"progress_pct": pct})
-            await r.publish(self.PROGRESS_CHANNEL.format(task_id=task_id), event.model_dump_json())
+            r = aioredis.from_url(str(settings.redis.url), decode_responses=True)
+            try:
+                event = NotificationEvent(task_id=task_id, event="progress",
+                                          message=message, data={"progress_pct": pct})
+                await r.publish(self.PROGRESS_CHANNEL.format(task_id=task_id), event.model_dump_json())
+            finally:
+                await r.aclose()
         except Exception as exc:
             logger.debug("[Monitoring] publish_progress skipped: %s", exc)
 
@@ -58,31 +69,24 @@ class MonitoringAgent:
         if not logs:
             return
         try:
-            r   = self._get_redis()
-            key = f"voiceops:logs:{task_id}"
-            await r.rpush(key, *logs)
-            await r.expire(key, settings.redis.ttl_session)
+            r = aioredis.from_url(str(settings.redis.url), decode_responses=True)
+            try:
+                key = f"voiceops:logs:{task_id}"
+                await r.rpush(key, *logs)
+                await r.expire(key, settings.redis.ttl_session)
+            finally:
+                await r.aclose()
         except Exception as exc:
             logger.debug("[Monitoring] capture_logs skipped: %s", exc)
 
 
 class NotificationAgent:
-    def __init__(self):
-        self._redis: Optional[aioredis.Redis] = None
-
-    def _get_redis(self) -> aioredis.Redis:
-        # BUG #3 FIX: no await
-        if self._redis is None:
-            self._redis = aioredis.from_url(str(settings.redis.url), decode_responses=True)
-        return self._redis
-
     def _format_message(self, task: Task) -> str:
-        # BUG #4 FIX: was hasattr() — always True on Pydantic model
         sw = task.intent_output.software_canonical if task.intent_output else "the software"
         if task.status == TaskStatus.COMPLETED:
-            return f"{sw} has been installed successfully."
+            return f"{sw}: task completed."
         elif task.status == TaskStatus.FAILED:
-            return f"Failed to install {sw}: {task.error or 'unknown error'}"
+            return f"{sw}: task failed — {task.error or 'unknown error'}"
         return f"Task {task.task_id}: {task.status.value}"
 
     async def notify(self, task: Task) -> None:
@@ -97,8 +101,11 @@ class NotificationAgent:
                   "progress": 100 if task.status == TaskStatus.COMPLETED else 0},
         )
         try:
-            r = self._get_redis()
-            await r.publish(f"voiceops:progress:{task.task_id}", event.model_dump_json())
-            await r.publish(f"voiceops:notify:{task.user_id}", event.model_dump_json())
+            r = aioredis.from_url(str(settings.redis.url), decode_responses=True)
+            try:
+                await r.publish(f"voiceops:progress:{task.task_id}", event.model_dump_json())
+                await r.publish(f"voiceops:notify:{task.user_id}", event.model_dump_json())
+            finally:
+                await r.aclose()
         except Exception as exc:
             logger.warning("[Notification] Redis publish skipped: %s", exc)

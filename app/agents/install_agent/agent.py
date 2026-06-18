@@ -1,36 +1,34 @@
 """
-InstallAgent
+Agent 6 — Install Agent  (REWRITTEN)
 
-FIXES IN THIS VERSION:
-  NEW FIX #E (GitHub Desktop / GitHub CLI missing from _WINGET_IDS):
-    The install agent had a local _WINGET_IDS dict that did NOT contain
-    "github desktop" or "github cli". Even though settings.registry.winget_packages
-    had the entries, _get_winget_id() checked the local dict first and the settings
-    dict second — but only did an exact-key match on the settings dict.
-    Fix: added GitHub Desktop, GitHub CLI, and 20+ other common apps to _WINGET_IDS.
-    Also improved _get_winget_id() to do case-insensitive partial matching against
-    the settings registry so unknown-but-close names resolve correctly.
+WHY THIS WAS REWRITTEN:
+  The previous version maintained `_WINGET_IDS`, a hardcoded dict of ~50
+  software-name -> winget-package-id entries, plus an LLM fallback
+  (`_discover_winget_id_via_llm`) that could hallucinate a package id with
+  NO verification it actually existed. Package ID resolution now happens
+  entirely upstream in SoftwareResolverAgent (which validates every id
+  against a live `winget search` / `brew search` / `apt-cache search`
+  result before it ever reaches this agent) — this agent's job is purely
+  EXECUTION: given an already-resolved, already-validated package id, run
+  the actual install or download command and report what really happened.
 
-  NEW FIX #F (LLM-assisted winget ID discovery for unknown software):
-    When _get_winget_id() returns None for a software name, the old code fell back
-    to using the raw software name as the winget package ID — which almost always
-    fails silently or installs the wrong thing.
-    Fix: added _discover_winget_id_via_llm() that asks Mistral to suggest the
-    correct winget package ID for any software not in our local registry. This makes
-    the system truly handle "whatever the user asks" without hardcoded IDs.
-
-  NEW FIX #G (Notification after background install):
-    After a successful winget install, log a clear message indicating the software
-    is now available so the notification agent can surface it properly.
+  NEW: a genuine download_only execution path. Previously "download X"
+  intent never reached this agent at all (main_workflow faked a
+  `__use_package_manager__` marker and skipped straight to a canned
+  success response). Now `download_only()` actually runs
+  `winget download --download-directory <Desktop>` (or the brew/apt/snap
+  equivalent metadata) and leaves a real installer file on the user's
+  Desktop, without executing it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import glob as _glob
 import logging
 import re
+import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -44,151 +42,6 @@ from app.models.schemas import (
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
-
-# ---------------------------------------------------------------------------
-# Winget package ID map — FIX #E: expanded with GitHub and many more
-# ---------------------------------------------------------------------------
-
-_WINGET_IDS: dict[str, str] = {
-    # Browsers
-    "google chrome":          "Google.Chrome",
-    "chrome":                 "Google.Chrome",
-    "mozilla firefox":        "Mozilla.Firefox",
-    "firefox":                "Mozilla.Firefox",
-    # Editors / IDEs
-    "visual studio code":     "Microsoft.VisualStudioCode",
-    "vs code":                "Microsoft.VisualStudioCode",
-    "vscode":                 "Microsoft.VisualStudioCode",
-    "notepad++":              "Notepad++.Notepad++",
-    "sublime text":           "SublimeHQ.SublimeText.4",
-    "sublime":                "SublimeHQ.SublimeText.4",
-    "intellij idea":          "JetBrains.IntelliJIDEA.Community",
-    "pycharm":                "JetBrains.PyCharm.Community",
-    "android studio":         "Google.AndroidStudio",
-    # Runtime / dev tools
-    "python":                 "Python.Python.3.12",
-    "python 3.12":            "Python.Python.3.12",
-    "python 3.11":            "Python.Python.3.11",
-    "python 3.10":            "Python.Python.3.10",
-    "node.js":                "OpenJS.NodeJS.LTS",
-    "nodejs":                 "OpenJS.NodeJS.LTS",
-    "node":                   "OpenJS.NodeJS.LTS",
-    "git":                    "Git.Git",
-    "java":                   "EclipseAdoptium.Temurin.21.JDK",
-    "java jdk":               "EclipseAdoptium.Temurin.21.JDK",
-    "rust":                   "Rustlang.Rustup",
-    "go":                     "GoLang.Go",
-    "golang":                 "GoLang.Go",
-    # FIX #E: GitHub entries were completely missing
-    "github desktop":         "GitHub.GitHubDesktop",
-    "github":                 "GitHub.GitHubDesktop",
-    "git hub":                "GitHub.GitHubDesktop",
-    "github cli":             "GitHub.cli",
-    "gh cli":                 "GitHub.cli",
-    "gh":                     "GitHub.cli",
-    # Containers / infra
-    "docker":                 "Docker.DockerDesktop",
-    "docker desktop":         "Docker.DockerDesktop",
-    "postman":                "Postman.Postman",
-    # Communication
-    "discord":                "Discord.Discord",
-    "zoom":                   "Zoom.Zoom",
-    "slack":                  "SlackTechnologies.Slack",
-    "microsoft teams":        "Microsoft.Teams",
-    "teams":                  "Microsoft.Teams",
-    "skype":                  "Microsoft.Skype",
-    "telegram":               "Telegram.TelegramDesktop",
-    "whatsapp":               "9E2F88E3.WhatsApp",
-    # Media / creative
-    "vlc":                    "VideoLAN.VLC",
-    "vlc media player":       "VideoLAN.VLC",
-    "obs studio":             "OBSProject.OBSStudio",
-    "obs":                    "OBSProject.OBSStudio",
-    "gimp":                   "GIMP.GIMP",
-    "inkscape":               "Inkscape.Inkscape",
-    "blender":                "BlenderFoundation.Blender",
-    "audacity":               "Audacity.Audacity",
-    "handbrake":              "HandBrake.HandBrake",
-    "vlc":                    "VideoLAN.VLC",
-    "spotify":                "Spotify.Spotify",
-    # Utilities
-    "7-zip":                  "7zip.7zip",
-    "7zip":                   "7zip.7zip",
-    "winrar":                 "RARLab.WinRAR",
-    "putty":                  "PuTTY.PuTTY",
-    "filezilla":              "TimKosse.FileZilla.Client",
-    "wireshark":              "WiresharkFoundation.Wireshark",
-    "notion":                 "Notion.Notion",
-    "figma":                  "Figma.Figma",
-    "anaconda":               "Anaconda.Anaconda3",
-    "steam":                  "Valve.Steam",
-}
-
-
-def _get_winget_id(software: str) -> Optional[str]:
-    """
-    FIX #E: improved lookup — checks local dict, then settings registry
-    with case-insensitive partial matching.
-    """
-    key = software.lower().strip()
-
-    # 1. Exact match in local dict
-    if key in _WINGET_IDS:
-        return _WINGET_IDS[key]
-
-    # 2. Exact match in settings registry (case-insensitive)
-    reg = settings.registry.winget_packages
-    for reg_key, pkg_id in reg.items():
-        if reg_key.lower() == key:
-            return pkg_id
-
-    # 3. Partial / substring match in local dict (handles "github desktop" → "github")
-    for dict_key, pkg_id in _WINGET_IDS.items():
-        if key in dict_key or dict_key in key:
-            return pkg_id
-
-    # 4. Partial match in settings registry
-    for reg_key, pkg_id in reg.items():
-        if key in reg_key.lower() or reg_key.lower() in key:
-            return pkg_id
-
-    return None
-
-
-def _discover_winget_id_via_llm(software: str) -> Optional[str]:
-    """
-    FIX #F: Ask Mistral for the correct winget package ID when our local
-    registry doesn't have the software. Returns None if the LLM can't
-    determine a reliable ID or if no API key is configured.
-    This is a blocking call — run inside asyncio.to_thread().
-    """
-    api_key = settings.llm.mistral_api_key
-    if not api_key:
-        return None
-    try:
-        from mistralai import Mistral
-        client = Mistral(api_key=api_key)
-        prompt = (
-            f"What is the exact winget package ID for '{software}' on Windows?\n"
-            "Reply with ONLY the package ID string (e.g. 'GitHub.GitHubDesktop'), "
-            "nothing else. If you are not certain, reply with the word UNKNOWN."
-        )
-        response = client.chat.complete(
-            model=settings.llm.intent_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=40,
-        )
-        result = response.choices[0].message.content.strip().strip('"').strip("'")
-        if result.upper() == "UNKNOWN" or " " in result or len(result) < 3:
-            logger.info("[InstallAgent] LLM could not determine winget ID for %r", software)
-            return None
-        logger.info("[InstallAgent] LLM suggested winget ID for %r: %r", software, result)
-        return result
-    except Exception as exc:
-        logger.warning("[InstallAgent] LLM winget ID discovery failed: %s", exc)
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Winget exit code helpers
@@ -238,7 +91,6 @@ TIMEOUT_SEC = 300   # 5 min max per install
 
 def _find_winget() -> Optional[str]:
     """Locate winget.exe — checks PATH and AppInstaller location."""
-    import shutil
     path = shutil.which("winget")
     if path:
         return path
@@ -263,10 +115,7 @@ def _extract_version(stdout: str) -> Optional[str]:
 
 
 def _run_winget(package_id: str) -> tuple[bool, str, list[str], Optional[str]]:
-    """
-    Synchronous winget install call — run inside asyncio.to_thread().
-    Returns (success, error_msg, logs, version_installed).
-    """
+    """Synchronous winget install call — run inside asyncio.to_thread()."""
     winget = _find_winget()
     if not winget:
         return False, "winget not found. Install App Installer from the Microsoft Store.", [], None
@@ -284,12 +133,8 @@ def _run_winget(package_id: str) -> tuple[bool, str, list[str], Optional[str]]:
 
     try:
         proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SEC,
-            encoding="utf-8",
-            errors="replace",
+            cmd, capture_output=True, text=True, timeout=TIMEOUT_SEC,
+            encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
         return False, f"winget timed out after {TIMEOUT_SEC}s", logs, None
@@ -318,12 +163,8 @@ def _run_winget(package_id: str) -> tuple[bool, str, list[str], Optional[str]]:
     return success, error or "", logs, version
 
 
-
 def _run_winget_store(package_id: str) -> tuple[bool, str, list[str], Optional[str]]:
-    """
-    Install a Microsoft Store app via winget using --source msstore.
-    Used for apps like ChatGPT (9NT1R1C2HH7J) that are Store-only.
-    """
+    """Install a Microsoft Store app via winget using --source msstore."""
     winget = _find_winget()
     if not winget:
         return False, "winget not found. Install App Installer from the Microsoft Store.", [], None
@@ -340,12 +181,8 @@ def _run_winget_store(package_id: str) -> tuple[bool, str, list[str], Optional[s
 
     try:
         proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SEC,
-            encoding="utf-8",
-            errors="replace",
+            cmd, capture_output=True, text=True, timeout=TIMEOUT_SEC,
+            encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
         return False, f"winget store timed out after {TIMEOUT_SEC}s", logs, None
@@ -372,7 +209,6 @@ def _run_winget_store(package_id: str) -> tuple[bool, str, list[str], Optional[s
 
 def _run_brew(package_id: str) -> tuple[bool, str, list[str], Optional[str]]:
     """macOS Homebrew install."""
-    import shutil
     brew = shutil.which("brew")
     if not brew:
         return False, "Homebrew not found. Install from https://brew.sh", [], None
@@ -443,7 +279,6 @@ def _run_installer_file(
             return False, f"Unsupported installer type: {ext}", logs, None
     elif os_target == OperatingSystem.MACOS:
         if ext == ".dmg":
-            import glob
             mount_result = subprocess.run(
                 ["hdiutil", "attach", str(path), "-nobrowse", "-quiet"],
                 capture_output=True, text=True, timeout=60,
@@ -455,7 +290,7 @@ def _run_installer_file(
             if not m:
                 return False, "Could not find DMG mount point", logs, None
             mount_point = m.group(1).strip()
-            apps = glob.glob(f"{mount_point}/*.app")
+            apps = _glob.glob(f"{mount_point}/*.app")
             if apps:
                 app = apps[0]
                 cp_result = subprocess.run(
@@ -502,18 +337,58 @@ def _run_winget_download_and_install(
     package_id: str, dest_dir: str
 ) -> tuple[bool, str, list[str], Optional[str], Optional[str]]:
     """
-    1. winget download → saves installer to dest_dir (Desktop)
+    1. winget download -> saves installer to dest_dir (Desktop)
     2. Runs the downloaded installer silently.
     Returns (success, error_msg, logs, version, local_path).
     """
-    import glob as _glob
+    success, error, logs, local_path = _winget_download_only(package_id, dest_dir)
+    if not success or not local_path:
+        return False, error, logs, None, local_path
+
+    ext = Path(local_path).suffix.lower()
+    if ext == ".exe":
+        run_cmd = [local_path, "/S", "/silent", "/quiet", "/norestart"]
+    elif ext == ".msi":
+        run_cmd = ["msiexec", "/i", local_path, "/quiet", "/norestart", "ALLUSERS=1"]
+    else:
+        return False, f"Unsupported installer type: {ext}", logs, None, local_path
+
+    logs.append(f"Install cmd: {' '.join(run_cmd)}")
+    try:
+        inst_proc = subprocess.run(
+            run_cmd, capture_output=True, text=True, timeout=TIMEOUT_SEC,
+            encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Installer timed out after {TIMEOUT_SEC}s", logs, None, local_path
+
+    logs.append(f"install stdout: {inst_proc.stdout[:2000]}")
+    if inst_proc.stderr:
+        logs.append(f"install stderr: {inst_proc.stderr[:500]}")
+
+    success = inst_proc.returncode in (0, 3010)
+    version = _extract_version(inst_proc.stdout) if success else None
+    error   = None if success else (
+        f"Installer failed (exit {inst_proc.returncode}): {inst_proc.stderr[:300]}"
+    )
+    return success, error or "", logs, version, local_path
+
+
+def _winget_download_only(
+    package_id: str, dest_dir: str
+) -> tuple[bool, str, list[str], Optional[str]]:
+    """
+    Runs `winget download` ONLY — leaves the real installer file in dest_dir
+    (the user's Desktop) without running/installing it. Used for the
+    download_only intent so "download X" produces an actual file on disk.
+    Returns (success, error_msg, logs, local_path).
+    """
     winget = _find_winget()
     if not winget:
-        return False, "winget not found.", [], None, None
+        return False, "winget not found.", [], None
 
     Path(dest_dir).mkdir(parents=True, exist_ok=True)
 
-    # ── Step 1: winget download ──────────────────────────────────────────
     dl_cmd = [
         winget, "download",
         "--id", package_id,
@@ -526,74 +401,32 @@ def _run_winget_download_and_install(
 
     try:
         dl_proc = subprocess.run(
-            dl_cmd,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SEC,
-            encoding="utf-8",
-            errors="replace",
+            dl_cmd, capture_output=True, text=True, timeout=TIMEOUT_SEC,
+            encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
-        return False, f"winget download timed out after {TIMEOUT_SEC}s", logs, None, None
+        return False, f"winget download timed out after {TIMEOUT_SEC}s", logs, None
     except FileNotFoundError:
-        return False, "winget.exe not found", logs, None, None
+        return False, "winget.exe not found", logs, None
 
     logs.append(f"download stdout: {dl_proc.stdout[:2000]}")
     if dl_proc.stderr:
         logs.append(f"download stderr: {dl_proc.stderr[:500]}")
 
-    if dl_proc.returncode not in (0, 1):
-        candidates = (
-            _glob.glob(str(Path(dest_dir) / "*.exe")) +
-            _glob.glob(str(Path(dest_dir) / "*.msi"))
-        )
-        if not candidates:
-            code_msg = _WINGET_EXIT_CODES.get(dl_proc.returncode, f"exit {dl_proc.returncode}")
-            return False, f"winget download failed: {code_msg}", logs, None, None
-
     candidates = (
         _glob.glob(str(Path(dest_dir) / "*.exe")) +
         _glob.glob(str(Path(dest_dir) / "*.msi"))
     )
+    if dl_proc.returncode not in (0, 1) and not candidates:
+        code_msg = _WINGET_EXIT_CODES.get(dl_proc.returncode, f"exit {dl_proc.returncode}")
+        return False, f"winget download failed: {code_msg}", logs, None
     if not candidates:
-        return False, f"winget download ran but no installer found in {dest_dir}", logs, None, None
+        return False, f"winget download ran but no installer found in {dest_dir}", logs, None
 
     installer_path = max(candidates, key=lambda p: Path(p).stat().st_mtime)
     logs.append(f"Installer saved to: {installer_path}")
     logger.info("[InstallAgent] Installer downloaded to: %s", installer_path)
-
-    # ── Step 2: run the installer silently ──────────────────────────────
-    ext = Path(installer_path).suffix.lower()
-    if ext == ".exe":
-        run_cmd = [installer_path, "/S", "/silent", "/quiet", "/norestart"]
-    elif ext == ".msi":
-        run_cmd = ["msiexec", "/i", installer_path, "/quiet", "/norestart", "ALLUSERS=1"]
-    else:
-        return False, f"Unsupported installer type: {ext}", logs, None, installer_path
-
-    logs.append(f"Install cmd: {' '.join(run_cmd)}")
-    try:
-        inst_proc = subprocess.run(
-            run_cmd,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SEC,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"Installer timed out after {TIMEOUT_SEC}s", logs, None, installer_path
-
-    logs.append(f"install stdout: {inst_proc.stdout[:2000]}")
-    if inst_proc.stderr:
-        logs.append(f"install stderr: {inst_proc.stderr[:500]}")
-
-    success = inst_proc.returncode in (0, 3010)
-    version = _extract_version(inst_proc.stdout) if success else None
-    error   = None if success else (
-        f"Installer failed (exit {inst_proc.returncode}): {inst_proc.stderr[:300]}"
-    )
-    return success, error or "", logs, version, installer_path
+    return True, "", logs, installer_path
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +434,13 @@ def _run_winget_download_and_install(
 # ---------------------------------------------------------------------------
 
 class InstallAgent:
-    """Agent 6 — Install Agent."""
+    """
+    Agent 6 — Install Agent.
+
+    Package-identity resolution (deciding WHAT package id to use) has
+    already happened upstream in SoftwareResolverAgent + PlannerAgent. This
+    agent only EXECUTES — it never looks up or guesses a package id itself.
+    """
 
     async def install(
         self,
@@ -620,183 +459,200 @@ class InstallAgent:
             download.local_path or "N/A",
         )
 
-        # ── Package-manager path ──────────────────────────────────────────────
-        if use_package_manager or (
-            download.local_path == "__use_package_manager__"
-        ):
-            # Honour explicit install_method from planner (e.g. winget_store)
+        if use_package_manager or download.local_path == "__use_package_manager__":
+            if not package_id:
+                return InstallResult(
+                    success=False, install_method="none",
+                    error=(
+                        "No package id was resolved for this software. "
+                        "The software resolver could not find it in the live "
+                        "package manager catalogue."
+                    ),
+                )
+
             if install_method_override == "winget_store" and os_target == OperatingSystem.WINDOWS:
-                pkg = package_id or software
-                success, error, logs, version = await asyncio.to_thread(_run_winget_store, pkg)
+                success, error, logs, version = await asyncio.to_thread(_run_winget_store, package_id)
                 duration = time.perf_counter() - t0
                 return InstallResult(
-                    success=success,
-                    install_method="winget_store",
-                    version_installed=version,
-                    install_duration_sec=round(duration, 2),
-                    logs=logs,
-                    error=error if not success else None,
+                    success=success, install_method="winget_store",
+                    version_installed=version, install_duration_sec=round(duration, 2),
+                    logs=logs, error=error if not success else None,
                 )
-            if (
-                settings.features.download_to_desktop
-                and os_target == OperatingSystem.WINDOWS
-            ):
+
+            if settings.features.download_to_desktop and os_target == OperatingSystem.WINDOWS:
                 return await self._install_via_download_to_desktop(
-                    software=software,
-                    package_id=package_id,
-                    t0=t0,
+                    software=software, package_id=package_id, t0=t0,
                 )
             return await self._install_via_package_manager(
-                software=software,
-                os_target=os_target,
-                package_id=package_id,
-                t0=t0,
+                software=software, os_target=os_target, package_id=package_id, t0=t0,
             )
 
-        # ── Installer file path ───────────────────────────────────────────────
+        # ── Installer file path (browser-discovered download) ──────────────
         if not download.success or not download.local_path:
             return InstallResult(
-                success=False,
-                install_method="none",
+                success=False, install_method="none",
                 error="No installer file available",
             )
 
         success, error, logs, version = await asyncio.to_thread(
             _run_installer_file, download.local_path, os_target
         )
-
         duration = time.perf_counter() - t0
         return InstallResult(
-            success=success,
-            install_method="installer_file",
-            version_installed=version,
-            install_duration_sec=round(duration, 2),
-            logs=logs,
-            error=error if not success else None,
+            success=success, install_method="installer_file",
+            version_installed=version, install_duration_sec=round(duration, 2),
+            logs=logs, error=error if not success else None,
         )
 
-    async def _install_via_download_to_desktop(
-        self,
-        software: str,
-        package_id: Optional[str],
-        t0: float,
-    ) -> InstallResult:
-        """Download installer to Desktop via winget, then run it silently."""
-        # FIX #E+F: resolve package ID properly
-        pkg_id = package_id or _get_winget_id(software)
-        if not pkg_id:
-            # FIX #F: ask LLM for the winget ID
-            pkg_id = await asyncio.to_thread(_discover_winget_id_via_llm, software)
-        if not pkg_id:
-            pkg_id = software  # last resort — use name directly
-
-        dest_dir = settings.desktop_dir
-
-        logger.info(
-            "[InstallAgent] Downloading %r to Desktop: %s", pkg_id, dest_dir
-        )
-        success, error, logs, version, local_path = await asyncio.to_thread(
-            _run_winget_download_and_install, pkg_id, dest_dir
-        )
-        duration = time.perf_counter() - t0
-
-        if success:
-            # FIX #G: explicit notification-ready log
-            logger.info(
-                "[InstallAgent] ✓ %r installed successfully via winget (%.1fs). "
-                "Installer on Desktop: %s",
-                software, duration, local_path,
-            )
-
-        return InstallResult(
-            success=success,
-            install_method="winget_desktop_download",
-            install_path=local_path,
-            version_installed=version,
-            install_duration_sec=round(duration, 2),
-            logs=logs,
-            error=error if not success else None,
-        )
-
-    async def _install_via_package_manager(
+    async def download_only(
         self,
         software: str,
         os_target: OperatingSystem,
         package_id: Optional[str],
-        t0: float,
-    ) -> InstallResult:
-        """Run the appropriate package manager for the target OS."""
+        install_method: Optional[str],
+    ) -> DownloadResult:
+        """
+        Executes the download_only intent for real: downloads the installer
+        file to the user's Desktop via the package manager's native download
+        command, WITHOUT running/installing it.
 
-        # FIX #E+F: Resolve package ID with LLM fallback
-        pkg_id = package_id or _get_winget_id(software)
-
-        if os_target == OperatingSystem.WINDOWS:
-            if not pkg_id:
-                pkg_id = await asyncio.to_thread(_discover_winget_id_via_llm, software)
-            if not pkg_id:
-                pkg_id = software
-            # Detect Microsoft Store package IDs (uppercase alphanumeric, no dots)
-            import re as _re
-            if _re.fullmatch(r"[A-Z0-9]{9,16}", pkg_id):
-                method = "winget_store"
-                success, error, logs, version = await asyncio.to_thread(
-                    _run_winget_store, pkg_id
-                )
-            else:
-                method = "winget"
-                success, error, logs, version = await asyncio.to_thread(
-                    _run_winget, pkg_id
-                )
-
-        elif os_target == OperatingSystem.MACOS:
-            if not pkg_id:
-                reg = settings.registry.brew_packages
-                pkg_id = reg.get(software) or software.lower().replace(" ", "-")
-            method = "brew"
-            success, error, logs, version = await asyncio.to_thread(
-                _run_brew, pkg_id
+        This is the fix for "download X" never producing anything on disk —
+        previously the workflow short-circuited this intent with a fake
+        `__use_package_manager__` marker and never called into this agent.
+        """
+        if not package_id:
+            return DownloadResult(
+                success=False,
+                error=(
+                    "No package id was resolved for this software — cannot "
+                    "download. The software resolver found no match in the "
+                    "live package manager catalogue."
+                ),
             )
 
-        elif os_target == OperatingSystem.LINUX:
-            apt_id  = settings.registry.apt_packages.get(software)
-            snap_id = settings.registry.snap_packages.get(software)
+        if os_target == OperatingSystem.WINDOWS:
+            dest_dir = settings.desktop_dir
+            success, error, logs, local_path = await asyncio.to_thread(
+                _winget_download_only, package_id, dest_dir
+            )
+            if success and local_path:
+                file_name = Path(local_path).name
+                size = Path(local_path).stat().st_size
+                logger.info(
+                    "[InstallAgent] ✓ Downloaded %r to Desktop (no install): %s",
+                    software, local_path,
+                )
+                return DownloadResult(
+                    success=True, local_path=local_path, file_name=file_name,
+                    file_size_bytes=size, verification="skipped",
+                )
+            return DownloadResult(success=False, error=error or "Download failed")
 
-            if apt_id:
-                method = "apt"
-                success, error, logs, version = await asyncio.to_thread(
-                    _run_apt, apt_id
+        if os_target == OperatingSystem.MACOS:
+            # Homebrew has no "download only, don't install" primitive for
+            # casks — `brew fetch --cask` downloads the artifact to the
+            # brew cache without installing it, which is the closest
+            # equivalent. We then copy it to the Desktop for the user.
+            brew = shutil.which("brew")
+            if not brew:
+                return DownloadResult(success=False, error="Homebrew not found. Install from https://brew.sh")
+            rc, out, err, cached_path = await asyncio.to_thread(_brew_fetch_cask, package_id)
+            if rc == 0 and cached_path:
+                dest = Path(settings.desktop_dir) / Path(cached_path).name
+                try:
+                    shutil.copy(cached_path, dest)
+                except Exception as exc:
+                    return DownloadResult(success=False, error=f"Downloaded but couldn't copy to Desktop: {exc}")
+                return DownloadResult(
+                    success=True, local_path=str(dest), file_name=dest.name,
+                    file_size_bytes=dest.stat().st_size, verification="skipped",
                 )
-            elif snap_id:
-                method = "snap"
-                success, error, logs, version = await asyncio.to_thread(
-                    _run_snap, snap_id
-                )
+            return DownloadResult(success=False, error=err or "brew fetch failed")
+
+        return DownloadResult(
+            success=False,
+            error=f"Download-only via package manager isn't supported on {os_target.value} yet.",
+        )
+
+    async def _install_via_download_to_desktop(
+        self, software: str, package_id: str, t0: float,
+    ) -> InstallResult:
+        """Download installer to Desktop via winget, then run it silently."""
+        dest_dir = settings.desktop_dir
+        logger.info("[InstallAgent] Downloading %r to Desktop: %s", package_id, dest_dir)
+        success, error, logs, version, local_path = await asyncio.to_thread(
+            _run_winget_download_and_install, package_id, dest_dir
+        )
+        duration = time.perf_counter() - t0
+
+        if success:
+            logger.info(
+                "[InstallAgent] ✓ %r installed successfully via winget (%.1fs). Installer on Desktop: %s",
+                software, duration, local_path,
+            )
+
+        return InstallResult(
+            success=success, install_method="winget_desktop_download",
+            install_path=local_path, version_installed=version,
+            install_duration_sec=round(duration, 2), logs=logs,
+            error=error if not success else None,
+        )
+
+    async def _install_via_package_manager(
+        self, software: str, os_target: OperatingSystem, package_id: str, t0: float,
+    ) -> InstallResult:
+        """Run the appropriate package manager for the target OS."""
+        if os_target == OperatingSystem.WINDOWS:
+            if _is_store_id(package_id):
+                method = "winget_store"
+                success, error, logs, version = await asyncio.to_thread(_run_winget_store, package_id)
             else:
-                method = "apt"
-                success, error, logs, version = await asyncio.to_thread(
-                    _run_apt, software.lower()
-                )
+                method = "winget"
+                success, error, logs, version = await asyncio.to_thread(_run_winget, package_id)
+
+        elif os_target == OperatingSystem.MACOS:
+            method = "brew"
+            success, error, logs, version = await asyncio.to_thread(_run_brew, package_id)
+
+        elif os_target == OperatingSystem.LINUX:
+            method = "apt"
+            success, error, logs, version = await asyncio.to_thread(_run_apt, package_id)
+            if not success and "not found" in (error or "").lower():
+                method = "snap"
+                success, error, logs, version = await asyncio.to_thread(_run_snap, package_id)
         else:
             return InstallResult(
-                success=False,
-                install_method="none",
+                success=False, install_method="none",
                 error=f"No package manager supported for OS: {os_target.value}",
             )
 
         duration = time.perf_counter() - t0
-
         if success:
-            # FIX #G: explicit notification-ready log
             logger.info(
                 "[InstallAgent] ✓ %r installed successfully via %s (%.1fs)",
                 software, method, duration,
             )
 
         return InstallResult(
-            success=success,
-            install_method=method,
-            version_installed=version,
-            install_duration_sec=round(duration, 2),
-            logs=logs,
+            success=success, install_method=method, version_installed=version,
+            install_duration_sec=round(duration, 2), logs=logs,
             error=error if not success else None,
         )
+
+
+def _brew_fetch_cask(package_id: str) -> tuple[int, str, str, Optional[str]]:
+    """Downloads a cask artifact via `brew fetch --cask` without installing it."""
+    brew = shutil.which("brew")
+    try:
+        proc = subprocess.run(
+            [brew, "fetch", "--cask", package_id],
+            capture_output=True, text=True, timeout=TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return -1, "", "brew fetch timed out", None
+
+    cached_path = None
+    m = re.search(r"Downloaded to:\s*(\S+)", proc.stdout + proc.stderr)
+    if m:
+        cached_path = m.group(1).strip()
+    return proc.returncode, proc.stdout, proc.stderr, cached_path

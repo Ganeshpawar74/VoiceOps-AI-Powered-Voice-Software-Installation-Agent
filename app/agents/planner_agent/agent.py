@@ -1,123 +1,46 @@
 """
-Agent 3 — Planner Agent (LangGraph Plan-and-Execute)
+Agent 3 — Planner Agent (LangGraph Plan-and-Execute)  (REWRITTEN)
 
-FIXES IN THIS VERSION:
-  NEW FIX #PLANNER-LLM:
-    Old behaviour: if software wasn't in winget_packages dict, immediately
-    fell through to browser_steps (Playwright) — which then failed with
-    NotImplementedError on Windows/Celery.
+WHY THIS WAS REWRITTEN:
+  The previous version resolved package IDs via `_get_local_pkg_id()`, which
+  looked things up in hardcoded dicts (`settings.registry.winget_packages`,
+  `brew_packages`, `apt_packages`, `snap_packages`) before ever falling back
+  to anything dynamic. That meant the vast majority of real-world software
+  requests (anything not already in those ~30-40-entry dicts) silently
+  fell through to the slow/unreliable browser-scraping path.
 
-    Fix: Added _resolve_pkg_id_via_llm() — when the local registry doesn't
-    have the package ID, ask Mistral for the winget ID. If the LLM returns
-    a plausible package ID, use pkg_manager path. This keeps the vast majority
-    of requests on the fast, reliable winget path and only falls through to
-    browser for truly exotic software.
+NEW DESIGN:
+  All package-id resolution is delegated to SoftwareResolverAgent, which
+  queries the LIVE package manager (winget search / brew search / apt-cache
+  search / snap find) as ground truth, using an LLM only to disambiguate
+  among real results or to clean up a noisy search term. No hardcoded
+  per-app dictionaries are consulted anywhere in this file.
 
-  NEW FIX #PLANNER-STORE:
-    Microsoft Store apps (ChatGPT = 9NT1R1C2HH7J) cannot be installed via
-    `winget install --id <id>` using the normal flow — they need
-    `winget install --id <id> --source msstore`.
-    The planner now detects Store IDs (all-caps alphanumeric) and passes
-    install_method=winget_store in the plan params.
+  download_only intent now also produces a real, executable step (download
+  the installer file to Desktop via the package manager's native "download"
+  command) instead of a no-op marker — see _download_only_steps().
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
-from typing import Any, Optional, TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+from app.agents.resolver_agent.agent import ResolvedPackage, SoftwareResolverAgent
 from app.config.settings import get_settings
 from app.models.schemas import ExecutionPlan, ExecutionStep, Intent, IntentOutput, OperatingSystem
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
+_resolver = SoftwareResolverAgent()
+
 
 def _is_store_id(pkg_id: str) -> bool:
-    """Microsoft Store IDs are uppercase alphanumeric, 12–14 chars, no dots."""
+    """Microsoft Store IDs are uppercase alphanumeric, 9-16 chars, no dots."""
     return bool(re.fullmatch(r"[A-Z0-9]{9,16}", pkg_id))
-
-
-def _get_local_pkg_id(software: str, os_: OperatingSystem) -> Optional[str]:
-    """Look up package ID in the settings registry (no API call)."""
-    lookup = {
-        OperatingSystem.WINDOWS: settings.registry.winget_packages,
-        OperatingSystem.MACOS:   settings.registry.brew_packages,
-        OperatingSystem.LINUX:   settings.registry.apt_packages,
-    }.get(os_, {})
-
-    # Exact match
-    if software in lookup:
-        return lookup[software]
-
-    # Case-insensitive match
-    sw_lower = software.lower()
-    for key, val in lookup.items():
-        if key.lower() == sw_lower:
-            return val
-
-    # Linux snap fallback
-    if os_ == OperatingSystem.LINUX:
-        snap = settings.registry.snap_packages
-        if software in snap:
-            return snap[software]
-        for key, val in snap.items():
-            if key.lower() == sw_lower:
-                return val
-
-    return None
-
-
-def _resolve_pkg_id_via_llm(software: str, os_: OperatingSystem) -> Optional[str]:
-    """
-    FIX #PLANNER-LLM: Ask Mistral for the package manager ID.
-    Blocking — run in thread.
-    """
-    api_key = settings.llm.mistral_api_key
-    if not api_key:
-        return None
-    try:
-        from mistralai import Mistral
-        client = Mistral(api_key=api_key)
-
-        mgr = {
-            OperatingSystem.WINDOWS: "winget",
-            OperatingSystem.MACOS:   "Homebrew cask",
-            OperatingSystem.LINUX:   "apt",
-        }.get(os_, "winget")
-
-        prompt = (
-            f"What is the exact {mgr} package ID for '{software}'?\n"
-            f"Reply with ONLY the package ID string (e.g. 'Google.Chrome' for winget, "
-            f"'google-chrome' for brew, 'google-chrome-stable' for apt).\n"
-            f"If you are not certain, reply UNKNOWN."
-        )
-        response = client.chat.complete(
-            model=settings.llm.intent_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=40,
-        )
-        result = response.choices[0].message.content.strip().strip('"').strip("'")
-        if result.upper() == "UNKNOWN" or len(result) < 2:
-            return None
-        logger.info("[PlannerAgent] LLM pkg id for %r (%s): %r", software, mgr, result)
-        return result
-    except Exception as exc:
-        logger.warning("[PlannerAgent] LLM pkg id lookup failed: %s", exc)
-        return None
-
-
-async def _resolve_pkg_id(software: str, os_: OperatingSystem) -> Optional[str]:
-    """Resolve package ID: local registry first, then LLM."""
-    pkg_id = _get_local_pkg_id(software, os_)
-    if pkg_id:
-        return pkg_id
-    # LLM fallback (async-safe via thread)
-    return await asyncio.to_thread(_resolve_pkg_id_via_llm, software, os_)
 
 
 def _browser_steps(intent: IntentOutput) -> list[ExecutionStep]:
@@ -180,6 +103,41 @@ def _install_steps(intent: IntentOutput) -> list[ExecutionStep]:
     ]
 
 
+def _pkg_manager_install_step(resolved: ResolvedPackage, sw: str, os_: OperatingSystem) -> ExecutionStep:
+    return ExecutionStep(
+        name="pkg_manager_install",
+        description=f"Install {sw} via {resolved.install_method} ({resolved.package_id})",
+        agent="install_agent",
+        tool=resolved.install_method or "winget",
+        params={
+            "package_id": resolved.package_id,
+            "software": resolved.display_name or sw,
+            "install_method": resolved.install_method,
+        },
+    )
+
+
+def _pkg_manager_download_only_step(resolved: ResolvedPackage, sw: str, os_: OperatingSystem) -> ExecutionStep:
+    """
+    FIX: download_only intent now produces a REAL executable step — download
+    the installer file to the user's Desktop via the package manager's
+    native download command, without running/installing it. Previously this
+    intent produced no step at all and the workflow fabricated a "success"
+    message with nothing actually happening on disk.
+    """
+    return ExecutionStep(
+        name="pkg_manager_download_only",
+        description=f"Download installer for {sw} to Desktop via {resolved.install_method} (no install)",
+        agent="install_agent",
+        tool="download_only",
+        params={
+            "package_id": resolved.package_id,
+            "software": resolved.display_name or sw,
+            "install_method": resolved.install_method,
+        },
+    )
+
+
 # ── LangGraph ──────────────────────────────────────────────────────────────
 
 class PlannerState(TypedDict):
@@ -187,6 +145,7 @@ class PlannerState(TypedDict):
     steps: list[dict[str, Any]]
     estimated_seconds: int
     done: bool
+    resolution_note: str
 
 
 async def _node_generate(state: PlannerState) -> PlannerState:
@@ -197,38 +156,27 @@ async def _node_generate(state: PlannerState) -> PlannerState:
 
     steps: list[ExecutionStep] = []
     est = 0
+    note = ""
 
     if intent.intent in (Intent.INSTALL_SOFTWARE, Intent.DOWNLOAD_ONLY):
-        # Try package manager path first (fast, reliable, no browser needed)
-        pkg_id = await _resolve_pkg_id(sw, os_)
+        # Resolve against the LIVE package manager — never a hardcoded dict.
+        resolved = await _resolver.resolve(sw, os_)
+        note = resolved.note
 
-        if pkg_id:
-            mgr = {
-                OperatingSystem.WINDOWS: "winget",
-                OperatingSystem.MACOS:   "brew",
-                OperatingSystem.LINUX:   "apt",
-            }.get(os_, "winget")
-
-            # Detect Microsoft Store IDs
-            install_method = "winget_store" if _is_store_id(pkg_id) else mgr
-
-            steps = [
-                ExecutionStep(
-                    name="pkg_manager_install",
-                    description=f"Install {sw} via {mgr} ({pkg_id})",
-                    agent="install_agent",
-                    tool=mgr,
-                    params={
-                        "package_id": pkg_id,
-                        "software": sw,
-                        "install_method": install_method,
-                    },
-                )
-            ]
-            est = 60 if intent.intent == Intent.INSTALL_SOFTWARE else 30
-
+        if resolved.found and resolved.package_id:
+            if intent.intent == Intent.DOWNLOAD_ONLY:
+                steps = [_pkg_manager_download_only_step(resolved, sw, os_)]
+                est = 30
+            else:
+                steps = [_pkg_manager_install_step(resolved, sw, os_)]
+                est = 60
         else:
-            # Browser + download + install path
+            # Genuinely not findable via any package manager — fall back to
+            # browser-based discovery of the vendor's own download page.
+            logger.info(
+                "[PlannerAgent] No package-manager match for %r — falling back to browser path (%s)",
+                sw, resolved.note,
+            )
             steps = _browser_steps(intent) + _download_steps()
             est = 120
             if intent.intent == Intent.INSTALL_SOFTWARE:
@@ -237,6 +185,7 @@ async def _node_generate(state: PlannerState) -> PlannerState:
 
     state["steps"] = [s.model_dump(mode='json') for s in steps]
     state["estimated_seconds"] = est
+    state["resolution_note"] = note
     return state
 
 
@@ -276,6 +225,7 @@ class PlannerAgent:
             "steps": [],
             "estimated_seconds": 0,
             "done": False,
+            "resolution_note": "",
         }
         final = await _compiled.ainvoke(init)
         return ExecutionPlan(

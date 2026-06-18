@@ -7,8 +7,10 @@ FIXES:
   This was the direct cause of every HTTP 500 on POST /text/command.
 """
 from __future__ import annotations
+import asyncio
 import json
 import logging
+import weakref
 from datetime import datetime
 from typing import Optional
 
@@ -43,19 +45,81 @@ class TaskRecord(Base):
     completed_at = Column(DateTime, nullable=True)
 
 
-_engine      = create_async_engine(str(settings.database.url), echo=settings.database.echo)
-_session_fac = async_sessionmaker(_engine, expire_on_commit=False)
 _memory_store: dict[str, str] = {}
+
+# FIX-EVENT-LOOP (this revision): the previous fix solved the cross-loop
+# reuse bug by creating a BRAND NEW engine (and therefore a brand new
+# connection pool) on every single save()/get()/list_for_user() call. That
+# avoided "attached to a different loop" errors, but leaked a connection
+# pool on every call, since nothing ever disposed of it — under sustained
+# traffic this exhausts the database's max-connection limit.
+#
+# Fix: cache the engine keyed by the CURRENTLY running event loop (a
+# WeakKeyDictionary so the entry disappears once that loop itself is
+# garbage-collected). Within one loop's lifetime — one FastAPI process, or
+# one Celery task — the same engine/pool is reused across all calls. Across
+# different loops (a new Celery task's fresh asyncio.run() loop) a new
+# engine is created automatically, since the old loop is a different key.
+# `dispose_engine()` additionally closes the pool for the loop that's
+# CURRENTLY finishing, so Celery's per-task cleanup is no longer a no-op.
+
+_engine_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _get_engine():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop (e.g. called from sync code) — fall back to an
+        # unkeyed engine that's created fresh each time; this path should
+        # not normally be hit since every caller here is async.
+        return create_async_engine(str(settings.database.url), echo=settings.database.echo)
+
+    engine = _engine_cache.get(loop)
+    if engine is None:
+        engine = create_async_engine(str(settings.database.url), echo=settings.database.echo)
+        _engine_cache[loop] = engine
+    return engine
+
+
+def _get_session_factory():
+    return async_sessionmaker(_get_engine(), expire_on_commit=False)
 
 
 async def dispose_engine() -> None:
-    await _engine.dispose()
+    """
+    Disposes the connection pool bound to the CURRENTLY running loop (if
+    one was ever created) and drops it from the cache. Called by
+    tasks.py at the end of every Celery task so each task's pool is
+    cleanly closed before its event loop is torn down. Safe to call
+    from FastAPI too (a no-op there until the next call recreates it,
+    which is fine — FastAPI's loop lives for the whole process).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    engine = _engine_cache.pop(loop, None)
+    if engine is not None:
+        try:
+            await engine.dispose()
+        except Exception as exc:
+            logger.debug("[TaskStore] engine dispose skipped: %s", exc)
 
 
 async def init_db():
+    """
+    One-time table creation at startup. Deliberately uses its OWN local
+    engine (not the cached one from _get_engine()) so that disposing it
+    immediately afterwards doesn't leave a dead/disposed engine sitting in
+    _engine_cache for the running loop — callers later in the same loop
+    should always get a fresh, live engine from _get_engine().
+    """
     try:
-        async with _engine.begin() as conn:
+        engine = create_async_engine(str(settings.database.url), echo=settings.database.echo)
+        async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        await engine.dispose()
         logger.info("[TaskStore] Database initialized successfully")
     except Exception as exc:
         logger.warning("[TaskStore] PostgreSQL unavailable at startup: %s — using in-memory fallback", exc)
@@ -89,7 +153,7 @@ class TaskStore:
 
         pg_ok = False
         try:
-            async with _session_fac() as session:
+            async with _get_session_factory()() as session:
                 existing = await session.get(TaskRecord, task.task_id)
                 if existing:
                     existing.status      = task.status.value
@@ -126,7 +190,7 @@ class TaskStore:
             logger.debug("[TaskStore] Redis get skipped: %s", exc)
 
         try:
-            async with _session_fac() as session:
+            async with _get_session_factory()() as session:
                 rec = await session.get(TaskRecord, task_id)
                 if rec is not None:
                     return Task(
@@ -146,7 +210,7 @@ class TaskStore:
 
     async def list_for_user(self, user_id: str, limit: int = 20) -> list[Task]:
         try:
-            async with _session_fac() as session:
+            async with _get_session_factory()() as session:
                 stmt = (select(TaskRecord)
                     .where(TaskRecord.user_id == user_id)
                     .order_by(TaskRecord.created_at.desc())

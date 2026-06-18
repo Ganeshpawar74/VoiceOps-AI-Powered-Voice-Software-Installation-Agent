@@ -1,28 +1,50 @@
 """
-Master LangGraph Workflow — orchestrates all agents.
+Master LangGraph Workflow — orchestrates all agents.  (REWRITTEN)
 
 ARCHITECTURE:
-  1. Speech Agent      → STT (Whisper / Sarvam)
-  2. Intent Agent      → Mistral LLM
-  3. Planner Agent     → LangGraph Plan-and-Execute
-  4. Browser Agent     → Playwright
-  5. Download Agent    → httpx + SHA-256
-  6. Install Agent     → winget / brew / apt / installer file
-  6b.Verify Agent      → post-install verification
-  7. Response Agent    → Mistral LLM natural language response
-  8. TTS Agent         → Sarvam TTS voice output
-  9. Notification Agent→ Redis pub/sub
+  1. Speech Agent          → STT (Whisper / Sarvam)
+  2. Intent Agent          → LLM-based intent + raw software-name extraction
+  3. Planner Agent         → resolves software via live package-manager search
+                              (SoftwareResolverAgent) and builds an execution plan
+  4. Browser Agent         → Playwright (only when no package-manager match exists)
+  5. Download Agent        → httpx + SHA-256 (only for browser-discovered installers)
+  6. Install Agent         → winget / brew / apt / installer file — OR, for
+                              download_only intent, downloads the installer to
+                              Desktop WITHOUT running it
+  6b. Verify Agent         → post-install verification (install path only)
+  7. Response Agent        → composes the final natural-language response from
+                              what ACTUALLY happened — never a canned success string
+  8. TTS Agent              → Sarvam TTS voice output
+  9. Notification Agent     → Redis pub/sub
 
-FIXES IN THIS VERSION:
-  FIX-1–9: All prior fixes retained.
-  FIX-10 (NEW): _MIN_SPEECH_CONFIDENCE lowered from 0.55 → 0.40.
-          Whisper's no_speech_prob heuristic returns low confidence even for
-          perfectly clear short commands. Speech agent now floors confidence
-          at 0.65 when a non-empty transcript is returned, and this workflow
-          threshold is set to 0.40 as an additional safety margin.
-  FIX-11 (NEW): node_notify now logs the actual software canonical name from
-          intent state so notification messages read "GitHub Desktop has been
-          installed successfully" instead of "the software has been installed".
+WHY THIS WAS REWRITTEN (root causes fixed):
+
+  FIX-DOWNLOAD-ONLY (the reported bug — "download chatgpt" did nothing):
+    The previous node_download(), whenever use_package_manager was true,
+    immediately wrote a fake DownloadResult with
+    local_path="__use_package_manager__" and routed straight to "response"
+    for download_only intent — meaning NOTHING was ever executed and
+    node_response synthesized a "has been installed successfully" sentence
+    unconditionally. Now: download_only intent calls
+    install_agent.download_only(), which runs `winget download` for real
+    and leaves an actual installer file on the user's Desktop. install_only
+    intent still flows through node_install as before.
+
+  FIX-EVENT-LOOP: Agents that hold a Redis client bound to the event loop
+    they were constructed in (MonitoringAgent, NotificationAgent) were
+    previously cached as module-level singletons in `_get_agents()`, while
+    each Celery task runs inside its OWN fresh event loop via
+    `asyncio.run()`. The second task onward reused a Redis connection bound
+    to a now-closed loop -> "Event loop is closed". Fix: agents that hold
+    any loop-bound resource are now constructed FRESH per workflow
+    invocation (see `_build_fresh_agents()`); only fully stateless agents
+    remain cached.
+
+  FIX-NO-FAKE-SUCCESS: node_response no longer has an unconditional
+    "X has been installed/downloaded successfully" branch. It only reports
+    success when the corresponding result object's `success` field is
+    actually True, and for the install path additionally checks the verify
+    result before saying "verified" language.
 """
 
 from __future__ import annotations
@@ -52,10 +74,6 @@ from app.models.schemas import (
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
-# FIX: lowered from 0.55 → 0.40. After VAD parameter relaxation and the
-# confidence floor added in speech_agent (FIX #9, #10), valid short commands
-# reliably return confidence ≥ 0.65. Setting threshold to 0.40 keeps a safety
-# net against genuinely garbled audio without false-rejecting real speech.
 _MIN_SPEECH_CONFIDENCE = 0.40
 
 
@@ -86,7 +104,13 @@ class WorkflowState(TypedDict):
 
 
 # ──────────────────────────────────────────────
-# Agent singletons (stateless) — lazy-loaded
+# Agent construction
+#
+# FIX-EVENT-LOOP: Stateless agents (no cached event-loop-bound resources)
+# are safe to keep as process-wide singletons for performance. Agents that
+# lazily cache a Redis client bound to "whichever loop was running when
+# first called" (MonitoringAgent, NotificationAgent) are rebuilt fresh on
+# every workflow invocation so they always bind to the CURRENT loop.
 # ──────────────────────────────────────────────
 
 _speech_agent   = None
@@ -96,20 +120,17 @@ _download_agent = None
 _install_agent  = None
 _verify_agent   = None
 _tts_agent      = None
-_monitor_agent  = None
-_notify_agent   = None
 
 
-def _get_agents():
-    """Lazy-load agents once so import errors surface as task failures, not app crashes."""
+def _get_stateless_agents():
+    """Lazy-load the agents that hold no loop-bound resources."""
     global _speech_agent, _intent_agent, _planner_agent, _download_agent
-    global _install_agent, _verify_agent, _tts_agent, _monitor_agent, _notify_agent
+    global _install_agent, _verify_agent, _tts_agent
 
     if _speech_agent is None:
         from app.agents.download_agent.agent import DownloadAgent
         from app.agents.install_agent.agent import InstallAgent
         from app.agents.intent_agent.agent import IntentAgent
-        from app.agents.monitoring_agent.agent import MonitoringAgent, NotificationAgent
         from app.agents.planner_agent.agent import PlannerAgent
         from app.agents.speech_agent.agent import SpeechAgent
         from app.agents.verify_agent.agent import VerifyAgent
@@ -122,13 +143,22 @@ def _get_agents():
         _install_agent  = InstallAgent()
         _verify_agent   = VerifyAgent()
         _tts_agent      = TTSAgent()
-        _monitor_agent  = MonitoringAgent()
-        _notify_agent   = NotificationAgent()
 
     return (
-        _speech_agent, _intent_agent, _planner_agent, _download_agent,
-        _install_agent, _verify_agent, _tts_agent, _monitor_agent, _notify_agent,
+        _speech_agent, _intent_agent, _planner_agent,
+        _download_agent, _install_agent, _verify_agent, _tts_agent,
     )
+
+
+def _build_fresh_loop_bound_agents():
+    """
+    FIX-EVENT-LOOP: construct MonitoringAgent/NotificationAgent fresh for
+    THIS workflow run, bound to whatever event loop is currently running.
+    Cheap to construct (just sets self._redis = None internally; the actual
+    aioredis client is created lazily on first use inside the live loop).
+    """
+    from app.agents.monitoring_agent.agent import MonitoringAgent, NotificationAgent
+    return MonitoringAgent(), NotificationAgent()
 
 
 # ──────────────────────────────────────────────
@@ -138,7 +168,7 @@ def _get_agents():
 async def node_speech(state: WorkflowState) -> WorkflowState:
     state["current_step"] = "speech"
     try:
-        speech_agent, *_ = _get_agents()
+        speech_agent, *_ = _get_stateless_agents()
         if state.get("audio_bytes"):
             audio = AudioInput(
                 audio_bytes=state["audio_bytes"],
@@ -181,7 +211,7 @@ async def node_intent(state: WorkflowState) -> WorkflowState:
         state["error"] = "Intent agent error: speech output missing"
         return state
     try:
-        _, intent_agent, *_ = _get_agents()
+        _, intent_agent, *_ = _get_stateless_agents()
         speech = SpeechOutput(**state["speech"])
         result: IntentOutput = await intent_agent.extract(speech)
 
@@ -212,7 +242,7 @@ async def node_planner(state: WorkflowState) -> WorkflowState:
         state["error"] = "Planner agent error: intent output missing"
         return state
     try:
-        _, _, planner_agent, *_ = _get_agents()
+        _, _, planner_agent, *_ = _get_stateless_agents()
         intent = IntentOutput(**state["intent"])
 
         if not intent.software_canonical and intent.intent == Intent.UNKNOWN:
@@ -225,7 +255,6 @@ async def node_planner(state: WorkflowState) -> WorkflowState:
         plan: ExecutionPlan = await planner_agent.plan(intent)
         state["plan"] = plan.model_dump(mode='json')
 
-        # RAG enrichment — only when enabled AND Qdrant is reachable
         if settings.features.rag_enabled:
             try:
                 from app.rag.store import RAGStore
@@ -240,9 +269,18 @@ async def node_planner(state: WorkflowState) -> WorkflowState:
                 logger.warning("[Workflow] RAG lookup failed (non-fatal): %s", rag_exc)
 
         steps = plan.steps or []
-        state["use_package_manager"] = (
-            len(steps) == 1 and steps[0].name == "pkg_manager_install"
+        state["use_package_manager"] = bool(steps) and steps[0].name in (
+            "pkg_manager_install", "pkg_manager_download_only",
         )
+
+        if not steps:
+            state["error"] = (
+                f"Couldn't find an installable package for "
+                f"\"{intent.software_canonical}\" on {intent.operating_system.value}, "
+                f"and no official download page could be located either."
+            )
+            return state
+
         logger.info(
             "[Workflow] Plan done: %d steps, use_pkg_mgr=%s",
             len(steps), state["use_package_manager"],
@@ -263,11 +301,9 @@ async def node_human_approval(state: WorkflowState) -> WorkflowState:
     plan    = ExecutionPlan(**state["plan"])
     intent  = IntentOutput(**state["intent"])
 
-    import json
     import redis.asyncio as aioredis
     from app.models.schemas import NotificationEvent
 
-    # from_url is sync in redis>=5 — NO await
     r = aioredis.from_url(str(settings.redis.url), decode_responses=True)
 
     approval_event = NotificationEvent(
@@ -352,17 +388,51 @@ async def node_browser(state: WorkflowState) -> WorkflowState:
 
 
 async def node_download(state: WorkflowState) -> WorkflowState:
+    """
+    FIX-DOWNLOAD-ONLY: this node now branches explicitly on intent.
+
+    - download_only + package-manager-resolved software: executes a REAL
+      download (winget download / brew fetch) straight to the user's
+      Desktop via InstallAgent.download_only(). The result is the actual
+      DownloadResult — no install ever runs, and the response node will
+      only claim success if this DownloadResult.success is True.
+    - install_software + package-manager-resolved software: still defers
+      the actual download+install to node_install's single winget/brew/apt
+      call (download-then-install is one atomic package-manager operation),
+      so this node just passes through a marker as before.
+    - Anything resolved via the browser path: unchanged real download via
+      DownloadAgent.
+    """
     state["current_step"] = "download"
     if state.get("error"):
         return state
 
     try:
-        _, _, _, download_agent, *_ = _get_agents()
+        _, _, _, download_agent, install_agent, *_ = _get_stateless_agents()
+        intent = IntentOutput(**state["intent"]) if state.get("intent") else None
 
         if state.get("use_package_manager"):
-            # If download_to_desktop is enabled, let InstallAgent handle the
-            # download itself (winget download → Desktop). Just mark as pkg_mgr.
-            # Otherwise, skip download entirely (legacy winget silent install).
+            plan_data = state.get("plan") or {}
+            steps = plan_data.get("steps") or []
+            first_step = steps[0] if steps else {}
+            params = first_step.get("params", {})
+            pkg_id = params.get("package_id")
+            install_method = params.get("install_method")
+
+            if intent and intent.intent == Intent.DOWNLOAD_ONLY:
+                result: DownloadResult = await install_agent.download_only(
+                    software=intent.software_canonical,
+                    os_target=intent.operating_system,
+                    package_id=pkg_id,
+                    install_method=install_method,
+                )
+                state["download"] = result.model_dump(mode='json')
+                if not result.success:
+                    state["error"] = result.error or "Download failed"
+                return state
+
+            # install_software path: defer to node_install's atomic
+            # download+install package-manager call.
             state["download"] = DownloadResult(
                 success=True,
                 local_path="__use_package_manager__",
@@ -400,11 +470,10 @@ async def node_install(state: WorkflowState) -> WorkflowState:
         return state
 
     try:
-        _, _, _, _, install_agent, *_ = _get_agents()
+        _, _, _, _, install_agent, *_ = _get_stateless_agents()
         download = DownloadResult(**state["download"])
         intent   = IntentOutput(**state["intent"])
 
-        # Resolve pkg_id and install_method from plan params
         pkg_id: Optional[str] = None
         plan_install_method: Optional[str] = None
         plan_data = state.get("plan")
@@ -432,7 +501,7 @@ async def node_install(state: WorkflowState) -> WorkflowState:
 
 
 async def node_verify(state: WorkflowState) -> WorkflowState:
-    """Post-install verification node."""
+    """Post-install verification node — install path only."""
     state["current_step"] = "verify"
     if not state.get("install") or not state.get("intent"):
         state["verify"] = {
@@ -445,7 +514,7 @@ async def node_verify(state: WorkflowState) -> WorkflowState:
         return state
 
     try:
-        _, _, _, _, _, verify_agent, *_ = _get_agents()
+        _, _, _, _, _, verify_agent, *_ = _get_stateless_agents()
         install = InstallResult(**state["install"])
         intent  = IntentOutput(**state["intent"])
 
@@ -480,35 +549,66 @@ async def node_verify(state: WorkflowState) -> WorkflowState:
 
 
 async def node_response(state: WorkflowState) -> WorkflowState:
-    """Mistral generates a human-like natural language response."""
+    """
+    Composes the final natural-language response from what ACTUALLY
+    happened. FIX-NO-FAKE-SUCCESS: there is no unconditional success
+    template here — every success branch is gated on the relevant result
+    object's own `success` field.
+    """
     state["current_step"] = "response"
     try:
         intent_data  = state.get("intent") or {}
+        download_data = state.get("download") or {}
         install_data = state.get("install") or {}
         verify_data  = state.get("verify") or {}
         error        = state.get("error")
 
         software = intent_data.get("software_canonical") or "the software"
         os_name  = intent_data.get("operating_system", "windows")
+        is_download_only = intent_data.get("intent") == Intent.DOWNLOAD_ONLY.value
 
         if error:
+            verb = "download" if is_download_only else "install"
             text = (
-                f"I was unable to complete the installation of {software}. "
-                f"The error was: {error}. Please try again or install manually."
+                f"I was unable to {verb} {software}. "
+                f"The error was: {error}. Please try again or do it manually."
             )
+
+        elif is_download_only:
+            if download_data.get("success") and download_data.get("local_path"):
+                file_name = download_data.get("file_name") or "the installer"
+                text = (
+                    f"{software} installer ({file_name}) has been downloaded to your "
+                    f"Desktop. It has NOT been installed — run it yourself when you're ready."
+                )
+            else:
+                err = download_data.get("error") or "the download did not complete"
+                text = f"I couldn't download {software}. Reason: {err}."
+
         elif install_data.get("success"):
             version = (
                 verify_data.get("version_found")
                 or install_data.get("version_installed")
             )
             method = install_data.get("install_method", "package manager")
-            verified = verify_data.get("verified", False)
-            verification_note = (
-                f" Version {version} confirmed." if version
-                else (" Installation verified on your system." if verified else "")
-            )
+            verified = bool(verify_data.get("verified", False))
+
+            if verified:
+                verification_note = (
+                    f" Verified on your system" + (f" — version {version}." if version else ".")
+                )
+            else:
+                # FIX-NO-FAKE-SUCCESS: install reported success, but our own
+                # verify step could not independently confirm it. Say so
+                # plainly rather than declaring an unqualified success.
+                verification_note = (
+                    " The installer reported success, but I could not "
+                    "independently confirm the install on your system yet — "
+                    "it may need a moment, or a restart of your terminal/PATH."
+                )
+
             text = (
-                f"{software} has been installed successfully on your {os_name} system "
+                f"{software} has been installed on your {os_name} system "
                 f"using {method}.{verification_note}"
             )
         else:
@@ -518,7 +618,6 @@ async def node_response(state: WorkflowState) -> WorkflowState:
                 "Please check the logs or try installing manually."
             )
 
-        # Try to enrich with Mistral if API key is set (non-blocking)
         if settings.llm.mistral_api_key:
             try:
                 text = await _enrich_response_with_llm(text, software, error)
@@ -526,28 +625,38 @@ async def node_response(state: WorkflowState) -> WorkflowState:
                 logger.debug("[Workflow] LLM response enrichment skipped: %s", llm_exc)
 
         state["response_text"] = text
-        logger.info("[Workflow] Response: %r", text[:100])
+        logger.info("[Workflow] Response: %r", text[:160])
     except Exception as exc:
         logger.warning("[Workflow] Response generation failed: %s", exc)
-        state["response_text"] = "Task completed."
+        state["response_text"] = (
+            "Something went wrong while preparing the response, but no success "
+            "should be assumed — please check the task status."
+        )
     return state
 
 
 async def _enrich_response_with_llm(template: str, software: str, error: Optional[str]) -> str:
-    """Use Mistral to make the response more conversational."""
+    """
+    Uses Mistral to make the response more conversational. Explicitly
+    instructed to preserve the factual content (success/failure, whether
+    anything was actually installed vs only downloaded) — it may only
+    restyle the wording, never invent additional claims of success.
+    """
     from mistralai import Mistral
     client = Mistral(api_key=settings.llm.mistral_api_key)
     prompt = (
-        f"You are a helpful voice assistant. Rephrase this installation status into "
-        f"a clear, friendly, one-sentence voice response. "
-        f"Be concise (under 30 words). Do not use markdown.\n\n"
+        f"You are a helpful voice assistant. Rephrase this status update into "
+        f"a clear, friendly, one-sentence voice response. Preserve all factual "
+        f"content exactly (what succeeded, what failed, what was/wasn't "
+        f"installed vs only downloaded) — do not add any claim of success that "
+        f"isn't already in the text below. Be concise (under 30 words). No markdown.\n\n"
         f"Status: {template}"
     )
     def _call():
         resp = client.chat.complete(
             model=settings.llm.intent_model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=80,
         )
         return resp.choices[0].message.content.strip()
@@ -560,7 +669,7 @@ async def node_tts(state: WorkflowState) -> WorkflowState:
     state["current_step"] = "tts"
     text = state.get("response_text") or "Task completed."
     try:
-        _, _, _, _, _, _, tts_agent, *_ = _get_agents()
+        *_, tts_agent = _get_stateless_agents()
         audio_b64 = await tts_agent.synthesize(text)
         state["tts_audio"] = audio_b64
         if audio_b64:
@@ -574,7 +683,8 @@ async def node_tts(state: WorkflowState) -> WorkflowState:
 async def node_notify(state: WorkflowState) -> WorkflowState:
     state["current_step"] = "notify"
     try:
-        *_, monitor_agent, notify_agent = _get_agents()
+        # FIX-EVENT-LOOP: build fresh, bound to the loop that's running NOW
+        monitor_agent, notify_agent = _build_fresh_loop_bound_agents()
         task = Task(**state["task"])
 
         if state.get("intent"):
@@ -582,7 +692,6 @@ async def node_notify(state: WorkflowState) -> WorkflowState:
         if state.get("install"):
             task.install_result = InstallResult(**state["install"])
 
-        # FIX: extract actual software name for notification messages
         software_name = ""
         if state.get("intent"):
             software_name = state["intent"].get("software_canonical", "")
@@ -592,17 +701,15 @@ async def node_notify(state: WorkflowState) -> WorkflowState:
             task.error  = state["error"]
             sw_label = f" for {software_name}" if software_name else ""
             logger.info(
-                "[Notification] task=%s status=failed msg=Failed to install%s: %s",
+                "[Notification] task=%s status=failed msg=Failed%s: %s",
                 task.task_id, sw_label, state["error"],
             )
         else:
             task.status       = TaskStatus.COMPLETED
             task.progress_pct = 100
-            # Use the actual software name from intent — not a hardcoded string
             logger.info(
-                "[Notification] task=%s status=completed msg=%s has been installed successfully.",
-                task.task_id,
-                software_name or "Software",
+                "[Notification] task=%s status=completed sw=%s",
+                task.task_id, software_name or "(unknown)",
             )
 
         install_data = state.get("install")
@@ -641,6 +748,12 @@ def _route_after_browser(state: WorkflowState) -> str:
     return "notify" if state.get("error") else "download"
 
 def _route_after_download(state: WorkflowState) -> str:
+    """
+    FIX-DOWNLOAD-ONLY: download_only intent now terminates at "response"
+    straight after a REAL download (no install ever runs for this intent —
+    that's the whole point of "download" vs "install"). install_software
+    intent continues to node_install as before.
+    """
     if state.get("error"):
         return "notify"
     intent_data = state.get("intent", {})
@@ -665,7 +778,7 @@ def _route_after_tts(state: WorkflowState) -> str:
 # Build the LangGraph — lazy singleton
 # ──────────────────────────────────────────────
 
-_workflow = None  # FIX-9: lazy build — not built at import time
+_workflow = None
 
 
 def _build_workflow():
@@ -725,7 +838,6 @@ def _build_workflow():
 
 
 def _get_workflow():
-    """FIX-9: Return lazily built workflow — safe to call from async context."""
     global _workflow
     if _workflow is None:
         _workflow = _build_workflow()
@@ -773,7 +885,7 @@ async def run_voice_workflow(
         "[Workflow] Starting task=%s query=%r os_hint=%s",
         task.task_id, text_query or "(voice)", os_hint,
     )
-    workflow = _get_workflow()   # FIX-9: lazy build
+    workflow = _get_workflow()
     final = await workflow.ainvoke(initial)
     logger.info(
         "[Workflow] Finished task=%s error=%s verified=%s",

@@ -64,8 +64,9 @@ def _verify_windows(software: str, pkg_id: Optional[str]) -> tuple[bool, str, Op
             version = _extract_version(out)
             return True, "winget_list", version
 
-    # 2. `where <exe>` — reliable on Windows PATH
-    exe_candidates = _exe_names(software)
+    # 2. `where <exe>` — reliable on Windows PATH. Candidate exe names are
+    #    derived dynamically from the software name (no hardcoded per-app map).
+    exe_candidates = _exe_names(software, pkg_id)
     for exe in exe_candidates:
         rc, out, _ = _run(["where", exe])
         if rc == 0 and out.strip():
@@ -73,53 +74,52 @@ def _verify_windows(software: str, pkg_id: Optional[str]) -> tuple[bool, str, Op
             version = _extract_version(ver_out) if ver_rc == 0 else None
             return True, f"where:{exe}", version
 
-    # 3. Check common install paths for GUI apps that don't register on PATH
-    install_path = _windows_app_path(software)
-    if install_path and os.path.exists(install_path):
+    # 3. Dynamic filesystem scan: GUI apps that don't register on PATH still
+    #    almost always land under Program Files / LocalAppData with a folder
+    #    or exe name close to the product name. No hardcoded per-app dict —
+    #    this glob-scans the real filesystem and fuzzy-matches the name.
+    install_path = _find_install_path_dynamically(software)
+    if install_path:
         return True, f"app_path:{install_path}", None
 
     return False, "not_found", None
 
 
-def _windows_app_path(software: str) -> Optional[str]:
-    """Return the expected .exe path for GUI apps not on PATH."""
-    local_app = os.environ.get("LOCALAPPDATA", "")
-    prog_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+def _find_install_path_dynamically(software: str) -> Optional[str]:
+    """
+    Dynamically searches common Windows install roots for an .exe whose
+    path/name plausibly matches `software`, instead of relying on a
+    hardcoded per-app path dictionary. This scales to any software without
+    needing a new dict entry per app.
+    """
+    import glob as _glob
+
+    local_app      = os.environ.get("LOCALAPPDATA", "")
+    prog_files     = os.environ.get("PROGRAMFILES", "C:\\Program Files")
     prog_files_x86 = os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")
 
-    known: dict[str, list[str]] = {
-        "Postman": [
-            os.path.join(local_app, "Postman", "Postman.exe"),
-        ],
-        "Discord": [
-            os.path.join(local_app, "Discord", "Update.exe"),
-        ],
-        "Slack": [
-            os.path.join(local_app, "slack", "slack.exe"),
-        ],
-        "Zoom": [
-            os.path.join(local_app, "Zoom", "bin", "Zoom.exe"),
-        ],
-        "OBS Studio": [
-            os.path.join(prog_files, "obs-studio", "bin", "64bit", "obs64.exe"),
-        ],
-        "GIMP": [
-            os.path.join(prog_files, "GIMP 2", "bin", "gimp-2.10.exe"),
-        ],
-        "Blender": [
-            os.path.join(prog_files, "Blender Foundation", "Blender", "blender.exe"),
-        ],
-        "VLC Media Player": [
-            os.path.join(prog_files, "VideoLAN", "VLC", "vlc.exe"),
-            os.path.join(prog_files_x86, "VideoLAN", "VLC", "vlc.exe"),
-        ],
-        "Inkscape": [
-            os.path.join(prog_files, "Inkscape", "bin", "inkscape.exe"),
-        ],
-    }
-    for path in known.get(software, []):
-        if path and os.path.exists(path):
-            return path
+    # Build a loose match token: strip spaces/punctuation, lowercase.
+    # e.g. "OBS Studio" -> "obsstudio", "VLC Media Player" -> "vlcmediaplayer"
+    target = re.sub(r"[^a-z0-9]", "", software.lower())
+    if not target:
+        return None
+
+    search_roots = [local_app, prog_files, prog_files_x86]
+    for root in search_roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            # Depth-limited glob: root/*/**.exe (covers the vast majority of
+            # installer layouts: Root/AppName/AppName.exe or
+            # Root/AppName/bin/AppName.exe etc.)
+            pattern = os.path.join(root, "*", "**", "*.exe")
+            for path in _glob.iglob(pattern, recursive=True):
+                rel = os.path.relpath(path, root)
+                rel_token = re.sub(r"[^a-z0-9]", "", rel.lower())
+                if target in rel_token:
+                    return path
+        except (OSError, ValueError):
+            continue
     return None
 
 
@@ -138,7 +138,7 @@ def _verify_macos(software: str, pkg_id: Optional[str]) -> tuple[bool, str, Opti
     if os.path.exists(app_path):
         return True, "app_bundle", None
 
-    exe_candidates = _exe_names(software)
+    exe_candidates = _exe_names(software, pkg_id)
     for exe in exe_candidates:
         path = shutil.which(exe)
         if path:
@@ -165,8 +165,7 @@ def _verify_linux(software: str, pkg_id: Optional[str]) -> tuple[bool, str, Opti
             version = _extract_version(out)
             return True, "snap_list", version
 
-    # 3. which
-    exe_candidates = _exe_names(software)
+    exe_candidates = _exe_names(software, pkg_id)
     for exe in exe_candidates:
         path = shutil.which(exe)
         if path:
@@ -177,31 +176,45 @@ def _verify_linux(software: str, pkg_id: Optional[str]) -> tuple[bool, str, Opti
     return False, "not_found", None
 
 
-def _exe_names(software: str) -> list[str]:
-    """Map canonical software name → likely CLI exe names."""
-    mapping: dict[str, list[str]] = {
-        "Visual Studio Code": ["code", "code-insiders"],
-        "Python":             ["python", "python3", "py"],
-        "Node.js":            ["node", "nodejs"],
-        "Git":                ["git"],
-        "Google Chrome":      ["chrome", "google-chrome", "chromium"],
-        "Mozilla Firefox":    ["firefox"],
-        "Docker Desktop":     ["docker"],
-        "Postman":            ["postman"],
-        "Slack":              ["slack"],
-        "Zoom":               ["zoom", "zoom.exe"],
-        "7-Zip":              ["7z", "7za"],
-        "Notepad++":          ["notepad++"],
-        "Discord":            ["discord"],
-        "VLC Media Player":   ["vlc"],
-        "OBS Studio":         ["obs", "obs-studio"],
-        "GIMP":               ["gimp"],
-        "Blender":            ["blender"],
-        "Inkscape":           ["inkscape"],
-        "Rust":               ["rustc", "cargo"],
-        "Go":                 ["go"],
-    }
-    candidates = mapping.get(software, [software.lower().split()[0]])
+def _exe_names(software: str, package_id: Optional[str] = None) -> list[str]:
+    """
+    Generates plausible CLI executable name candidates from the software
+    name (and, if available, the resolved package id) — no static per-app
+    dictionary, consistent with the rest of the system's design.
+
+    This is a best-effort heuristic only. The canonical signal is `winget
+    list` / `brew list` / `dpkg -l` (tried first in each _verify_* function);
+    this is the second-tier check, and if every guess here misses too,
+    `_find_install_path_dynamically` (a real filesystem glob+fuzzy-match
+    scan) is the final fallback — so an imperfect guess here is never fatal.
+    """
+    sw = (software or "").strip()
+    if not sw:
+        return []
+
+    words = re.findall(r"[A-Za-z0-9+#.]+", sw)
+    if not words:
+        return []
+
+    candidates: list[str] = []
+
+    def _add(token: str) -> None:
+        token = token.strip().lower()
+        if token and token not in candidates:
+            candidates.append(token)
+
+    _add("".join(words))                       # "visualstudiocode"
+    _add("-".join(w.lower() for w in words))   # "visual-studio-code"
+    _add(words[-1])                            # "code"  (often the real binary)
+    _add(words[0])                             # "visual"
+
+    # The package id frequently encodes the real binary name, e.g.
+    # "Microsoft.VisualStudioCode" -> "visualstudiocode",
+    # "VideoLAN.VLC" -> "vlc", "Mozilla.Firefox" -> "firefox"
+    if package_id:
+        tail = package_id.split(".")[-1]
+        _add(re.sub(r"[^a-z0-9]", "", tail.lower()))
+
     return candidates
 
 
