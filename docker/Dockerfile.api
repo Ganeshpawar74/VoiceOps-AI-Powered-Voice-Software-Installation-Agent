@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
 # System deps: gcc for compiled packages, curl for healthcheck
@@ -15,8 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY .env.example .env
 
-# Expose FastAPI port
+# Expose FastAPI port (informational only — Railway routes via $PORT)
 EXPOSE 8000
 
-# Run with uvicorn
-CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
+# Railway injects $PORT at runtime — shell form so it actually expands.
+# Falls back to 8000 for local `docker run` without -e PORT=...
+CMD uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level info
